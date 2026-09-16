@@ -1,0 +1,48 @@
+# ---- Secrets / local config ----
+.env
+.env.*
+!.env.example
+
+# ---- Maven build output ----
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+pom.xml.versionsBackup
+pom.xml.next
+release.properties
+dependency-reduced-pom.xml
+buildNumber.properties
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# ---- Compiled class / package files ----
+*.class
+*.jar
+*.war
+*.ear
+*.nar
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- IDE: IntelliJ IDEA ----
+.idea/
+*.iml
+*.ipr
+*.iws
+out/
+
+# ---- IDE: Eclipse ----
+.classpath
+.project
+.settings/
+bin/
+
+# ---- IDE: VS Code ----
+.vscode/
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+.idea/**

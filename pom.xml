@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.tencentcloudapi.observability</groupId>
+    <artifactId>tencentcloud-agentobs-sdk-agentscope-java</artifactId>
+    <version>0.0.1</version>
+    <packaging>jar</packaging>
+
+    <name>tencentcloud-agentobs-sdk-agentscope-java</name>
+    <description>
+        Tencent Cloud CLS observability SDK for AgentScope Java (v2), enhanced.
+        Ships its own ClsTracingMiddleware that captures the fields the stock
+        OtelTracingMiddleware omits — session.id / user.id, tool arguments,
+        streamed tool results, and reasoning thoughts — and exports OpenTelemetry
+        spans to Tencent Cloud CLS via the standard OTLP/HTTP protocol.
+    </description>
+    <url>https://github.com/TencentCloud/tencentcloud-agentobs-sdk-agentscope-java</url>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+        <opentelemetry.version>1.61.0</opentelemetry.version>
+        <agentscope.version>2.0.0</agentscope.version>
+        <jackson.version>2.17.2</jackson.version>
+        <slf4j.version>2.0.13</slf4j.version>
+        <reactor.version>3.6.6</reactor.version>
+    </properties>
+
+    <dependencies>
+        <!-- OpenTelemetry SDK: TracerProvider / BatchSpanProcessor wiring -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-sdk-trace</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-api</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+
+        <!-- OTLP exporter: uploads spans to CLS's OTLP/HTTP trace endpoint -->
+        <dependency>
+            <groupId>io.opentelemetry</groupId>
+            <artifactId>opentelemetry-exporter-otlp</artifactId>
+            <version>${opentelemetry.version}</version>
+        </dependency>
+
+        <!-- Jackson: JSON serialization for tool-call arguments in the middleware -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>${jackson.version}</version>
+        </dependency>
+
+        <!-- SLF4J logging facade -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
+        </dependency>
+
+        <!-- AgentScope Java v2: middleware SPI + event/message types.
+             Provided by the user's application at runtime. -->
+        <dependency>
+            <groupId>io.agentscope</groupId>
+            <artifactId>agentscope-core</artifactId>
+            <version>${agentscope.version}</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Reactor: MiddlewareBase hooks return Flux; provided transitively by
+             agentscope-core at runtime, but referenced directly in our middleware. -->
+        <dependency>
+            <groupId>io.projectreactor</groupId>
+            <artifactId>reactor-core</artifactId>
+            <version>${reactor.version}</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- OpenTelemetry <-> Reactor context propagation. AgentScope's own
+             OtelTracingMiddleware relies on this to thread the parent otel Context
+             through the reactive pipeline (Context.current() is unreliable across
+             the reactive, multi-threaded execution). We use the SAME mechanism so
+             our invoke_agent -> chat / execute_tool spans share one trace.
+             agentscope-core pulls this at 'compile', so it is present at runtime. -->
+        <dependency>
+            <groupId>io.opentelemetry.instrumentation</groupId>
+            <artifactId>opentelemetry-reactor-3.1</artifactId>
+            <version>2.27.0-alpha</version>
+            <scope>provided</scope>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Test -->
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>5.10.2</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>${slf4j.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.2.0</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>
