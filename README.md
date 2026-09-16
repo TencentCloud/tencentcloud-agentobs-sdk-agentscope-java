@@ -2,16 +2,21 @@
 
 > **English** | [中文](./README.zh-CN.md)
 
-Tencent Cloud CLS observability SDK for **AgentScope Java** — v2 (enhanced).
+Tencent Cloud CLS observability SDK for **AgentScope Java**.
 
-v2 ships its **own** `ClsTracingMiddleware` instead of relying on AgentScope's stock
-`OtelTracingMiddleware`. It captures the fields the stock middleware omits and exports
-OpenTelemetry spans to Tencent Cloud CLS over the standard **OTLP/HTTP** protocol (CLS's
-OpenTelemetry trace ingestion endpoint) — vendor-neutral transport, still landing in CLS.
+This SDK provides `ClsTracingMiddleware` — a custom OpenTelemetry-based tracing middleware
+that captures rich agent execution details and exports spans to
+[Tencent Cloud CLS](https://cloud.tencent.com/product/cls) over the standard **OTLP/HTTP**
+protocol — vendor-neutral transport, data landing in CLS.
 
-All span attributes follow the **CLS GenAI Trace spec** dotted keys (`gen_ai.*`), and the
-SDK uses a **per-turn trace model**: each user interaction is one independent trace, with
-the session linked across turns via the `gen_ai.session.id` attribute.
+### Key features
+
+- **Full span hierarchy** — `entry → agent → step → chat / tool` per user turn
+- **Rich attribute capture** — session/user identity, tool arguments & results, reasoning thoughts, streamed output text, token usage (incl. cache)
+- **Human-in-the-loop (HITL) awareness** — tracks confirm / external-exec / denied / interrupt states
+- **Concurrency-safe & stateless** — per-invocation state via Reactor Context; single instance safe across concurrent turns
+- **CLS GenAI Trace spec** compliant — all attributes use `gen_ai.*` dotted keys
+- **Per-turn trace model** — each user interaction is one independent trace, sessions linked via `gen_ai.session.id`
 
 ## Span tree (per turn)
 
@@ -64,35 +69,6 @@ On resume, tools executed outside the agent arrive via `ExternalExecutionResultE
 `gen_ai.tool.execution=external`. Cancelled `chat` / `tool` / `step` spans are marked
 `gen_ai.incomplete=true` so a "stuck waiting" span is distinguishable from a clean finish.
 
-## What v2 adds over v1
-
-| Capability | v1 (`OtelTracingMiddleware`) | v2 (`ClsTracingMiddleware`) |
-|---|---|---|
-| `gen_ai.session.id` / `gen_ai.user.id` (from `RuntimeContext`) | ❌ not read | ✅ promoted to CLS columns |
-| `entry` / `step` span layers + `gen_ai.turn.id` | ❌ | ✅ full per-turn hierarchy |
-| Tool call arguments (`ToolUseBlock.getInput()`) | ❌ | ✅ `gen_ai.tool.call.arguments` |
-| Tool result body (streamed `ToolResultTextDeltaEvent`) | ❌ | ✅ `gen_ai.tool.call.result` |
-| Reasoning thought (streamed `ThinkingBlockDeltaEvent`) | ❌ | ✅ `gen_ai.react.thought` |
-| Output text (streamed `TextBlockDeltaEvent`) | partial | ✅ `gen_ai.output.messages` |
-| token usage incl. cached | input/output | + `total` + `cache_read.input_tokens` |
-| Synthetic ReAct `gen_ai.step.id` / round | ❌ | ✅ derived per ReAct round |
-| HITL awareness (confirm / external-exec / denied / interrupt) | ❌ | ✅ `gen_ai.finish_reason` + `turn.completed` + external tool spans |
-| Concurrency / HITL-safe state | shared fields | ✅ stateless — per-invocation state via Reactor Context |
-
-The `ClsConfig` class carries over from v1, so the same four fields configure both SDKs.
-Under OTLP, spans are shipped with the spec's `gen_ai.*` attribute keys, which the OTLP→CLS
-conversion promotes to first-class columns server-side — no client-side JSON conversion needed.
-
-### Transport
-
-| | v1 / CLS-native v2 | this OTLP v2 |
-|---|---|---|
-| Protocol | CLS Java SDK (`PutLogs`) | OTLP/HTTP (`opentelemetry-exporter-otlp`) |
-| Endpoint | `<region>.cls.tencentcs.com` | `<region>.cls.tencentcs.com/v1/traces` |
-| Auth | signed request | `Authorization: Basic base64(SecretId:SecretKey)` header |
-| Topic routing | SDK topicId | `topic_id` HTTP header |
-| Payload | hand-built CLS JSON | standard OTLP span (attributes as-is) |
-
 ## Field sources (verified against agentscope-java source)
 
 | CLS attribute | Source |
@@ -112,9 +88,9 @@ conversion promotes to first-class columns server-side — no client-side JSON c
 | `gen_ai.response.finish_reasons` / `react.finish_reason` | derived from whether a `ToolCallStartEvent` was seen before `ModelCallEndEvent` |
 | `gen_ai.finish_reason` / `turn.completed` | derived from HITL events + Reactor signal (see HITL table) |
 
-Not available from the framework (documented gaps): cache_creation vs cache_read split,
-reasoning-token count, and cost — these require an external pricing table or are simply not
-emitted by AgentScope.
+> **Note:** cache_creation vs cache_read split, reasoning-token count, and cost are not
+> available from the framework — these require an external pricing table or are simply not
+> emitted by AgentScope.
 
 ## Quick start
 

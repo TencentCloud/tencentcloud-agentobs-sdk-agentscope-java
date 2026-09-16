@@ -2,16 +2,20 @@
 
 > [English](./README.md) | **中文**
 
-面向 **AgentScope Java** 的腾讯云 CLS 可观测性 SDK —— v2（增强版）。
+面向 **AgentScope Java** 的腾讯云 CLS 可观测性 SDK。
 
-v2 提供**自研**的 `ClsTracingMiddleware`，不再依赖 AgentScope 自带的
-`OtelTracingMiddleware`。它捕获自带中间件遗漏的字段，并通过标准 **OTLP/HTTP** 协议
-（CLS 的 OpenTelemetry trace 接入端点）将 OpenTelemetry span 导出到腾讯云 CLS ——
-传输层厂商中立，数据最终仍落到 CLS。
+本 SDK 提供 `ClsTracingMiddleware` —— 一个基于 OpenTelemetry 的自研 tracing 中间件，
+能够捕获丰富的 Agent 执行细节，并通过标准 **OTLP/HTTP** 协议将 span 导出到
+[腾讯云 CLS](https://cloud.tencent.com/product/cls) —— 传输层厂商中立，数据最终落入 CLS。
 
-所有 span 属性遵循 **CLS GenAI Trace 规范**的点分命名（`gen_ai.*`），并采用
-**per-turn trace 模型**：每次用户交互 = 一个独立 Trace，session 通过
-`gen_ai.session.id` 属性跨 turn 关联。
+### 核心特性
+
+- **完整 span 层级** —— 每个用户 turn 产出 `entry → agent → step → chat / tool` 层级树
+- **丰富的属性采集** —— session/user 身份、工具入参与结果、推理思考过程、流式输出文本、token 用量（含缓存）
+- **人工介入（HITL）感知** —— 跟踪确认 / 外部执行 / 拒绝 / 中断等状态
+- **并发安全 & 无状态** —— 状态随 Reactor Context 逐次调用隔离，单实例可安全用于并发场景
+- **CLS GenAI Trace 规范**兼容 —— 所有属性使用 `gen_ai.*` 点分命名
+- **Per-turn trace 模型** —— 每次用户交互 = 一个独立 Trace，session 通过 `gen_ai.session.id` 跨 turn 关联
 
 ## Span 层级（每个 turn）
 
@@ -64,35 +68,6 @@ per-turn 字段；所有 turn/round 状态都存在随 Reactor Context 传递的
 `gen_ai.tool.execution=external`。被取消的 `chat` / `tool` / `step` span 会标记
 `gen_ai.incomplete=true`，从而把"卡在等人"的 span 与正常完成区分开。
 
-## v2 相比 v1 新增能力
-
-| 能力 | v1（`OtelTracingMiddleware`） | v2（`ClsTracingMiddleware`） |
-|---|---|---|
-| `gen_ai.session.id` / `gen_ai.user.id`（来自 `RuntimeContext`） | ❌ 未读取 | ✅ 提升为 CLS 列 |
-| `entry` / `step` span 层级 + `gen_ai.turn.id` | ❌ | ✅ 完整 per-turn 层级 |
-| 工具调用入参（`ToolUseBlock.getInput()`） | ❌ | ✅ `gen_ai.tool.call.arguments` |
-| 工具结果内容（流式 `ToolResultTextDeltaEvent`） | ❌ | ✅ `gen_ai.tool.call.result` |
-| 推理思考过程（流式 `ThinkingBlockDeltaEvent`） | ❌ | ✅ `gen_ai.react.thought` |
-| 输出文本（流式 `TextBlockDeltaEvent`） | 部分 | ✅ `gen_ai.output.messages` |
-| token 用量（含缓存） | input/output | + `total` + `cache_read.input_tokens` |
-| 合成的 ReAct `gen_ai.step.id` / 轮次 | ❌ | ✅ 每个 ReAct 轮次派生 |
-| HITL 感知（确认 / 外部执行 / 拒绝 / 中断） | ❌ | ✅ `gen_ai.finish_reason` + `turn.completed` + 外部工具 span |
-| 并发 / HITL 安全的状态管理 | 共享字段 | ✅ 无状态 —— 状态随 Reactor Context 逐次调用隔离 |
-
-`ClsConfig` 类沿用自 v1，因此同样的四个字段可同时配置两套 SDK。
-在 OTLP 下，span 直接携带规范的 `gen_ai.*` 属性键，由服务端 OTLP→CLS 转换
-提升为一等公民列 —— 无需客户端做 JSON 转换。
-
-### 传输方式
-
-| | v1 / CLS 原生 v2 | 本 OTLP v2 |
-|---|---|---|
-| 协议 | CLS Java SDK（`PutLogs`） | OTLP/HTTP（`opentelemetry-exporter-otlp`） |
-| 端点 | `<region>.cls.tencentcs.com` | `<region>.cls.tencentcs.com/v1/traces` |
-| 鉴权 | 签名请求 | `Authorization: Basic base64(SecretId:SecretKey)` 请求头 |
-| 主题路由 | SDK topicId | `topic_id` HTTP 请求头 |
-| 载荷 | 手工构造的 CLS JSON | 标准 OTLP span（属性原样上报） |
-
 ## 字段来源（已对照 agentscope-java 源码核实）
 
 | CLS 属性 | 来源 |
@@ -112,8 +87,8 @@ per-turn 字段；所有 turn/round 状态都存在随 Reactor Context 传递的
 | `gen_ai.response.finish_reasons` / `react.finish_reason` | 依据 `ModelCallEndEvent` 之前是否出现过 `ToolCallStartEvent` 推导 |
 | `gen_ai.finish_reason` / `turn.completed` | 依据 HITL 事件 + Reactor 信号推导（见 HITL 表） |
 
-框架无法提供（已知缺口）：cache_creation 与 cache_read 的拆分、推理 token 数、
-以及成本 —— 这些要么需要外部计价表，要么 AgentScope 根本不产出。
+> **注意：** cache_creation 与 cache_read 的拆分、推理 token 数以及成本目前无法从框架获取
+> —— 这些要么需要外部计价表，要么 AgentScope 根本不产出。
 
 ## 快速开始
 
