@@ -22,8 +22,12 @@ jobs:
         server-password: MAVEN_PASSWORD
         gpg-private-key: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
         gpg-passphrase: MAVEN_GPG_PASSPHRASE
+    - name: Configure GPG agent
+      run: |
+        echo "allow-loopback-pinentry" >> ~/.gnupg/gpg-agent.conf
+        gpgconf --reload gpg-agent
     - name: Publish package
-      run: mvn --batch-mode clean deploy
+      run: mvn --batch-mode clean deploy -Dgpg.passphrase=${{ secrets.OSSRH_GPG_PASSPHRASE }}
       env:
         MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
         MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
