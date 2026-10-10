@@ -36,13 +36,6 @@
         </developer>
     </developers>
 
-    <distributionManagement>
-        <snapshotRepository>
-            <id>Releases</id>
-            <url>https://central.sonatype.com/repository/maven-snapshots/</url>
-        </snapshotRepository>
-    </distributionManagement>
-
     <scm>
         <connection>scm:git:git://github.com/TencentCloud/tencentcloud-agentobs-sdk-agentscope-java.git</connection>
         <developerConnection>scm:git:ssh://github.com:TencentCloud/tencentcloud-agentobs-sdk-agentscope-java.git</developerConnection>
@@ -228,7 +221,6 @@
                 <configuration>
                     <publishingServerId>central</publishingServerId>
                     <autoPublish>true</autoPublish>
-                    <waitUntil>published</waitUntil>
                 </configuration>
             </plugin>
         </plugins>
