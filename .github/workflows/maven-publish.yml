@@ -22,29 +22,21 @@ jobs:
         gpg-private-key: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
         gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
-    - name: Build and prepare bundle (no upload)
-      run: mvn --batch-mode clean verify -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}"
-      env:
-        MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_PASSPHRASE }}
-
-    - name: Inspect target directory
-      run: |
-        echo "=== target directory structure ==="
-        find target -type f 2>/dev/null | grep -v classes | grep -v test-classes | sort
-
     - name: Publish package
-      run: mvn --batch-mode deploy -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" -DskipTests
+      run: |
+        mvn --batch-mode clean deploy \
+          -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" \
+          -DskipTests \
+          -Daether.generatedMetadata.skip=true \
+          -Daether.artifactResolver.trackingFile.enabled=false
       env:
         MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
         MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
         MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_PASSPHRASE }}
 
-    - name: Inspect bundle contents (after publish attempt)
-      if: always()
+    - name: Inspect bundle contents on failure
+      if: failure()
       run: |
-        echo "=== central-publishing directory structure ==="
-        find target/central-publishing -type f 2>/dev/null | sort || echo "No central-publishing directory"
-        echo ""
         echo "=== Bundle zip contents ==="
         if [ -f target/central-publishing/central-bundle.zip ]; then
           unzip -l target/central-publishing/central-bundle.zip
@@ -52,9 +44,14 @@ jobs:
           echo "No bundle zip found"
         fi
 
-    - name: Publish package
-      run: mvn --batch-mode deploy -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" -DskipTests
-      env:
-        MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
-        MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
-        MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_PASSPHRASE }}
+    - name: Clean bundle and republish on first failure
+      if: failure()
+      run: |
+        echo "=== Attempting to clean bundle and republish ==="
+        # 清理 central-staging 中的脏文件
+        if [ -d target/central-staging ]; then
+          find target/central-staging -name "_remote.repositories*" -delete
+          find target/central-staging -name "maven-metadata-local.xml*" -delete
+          echo "Cleaned staging dir, files remaining:"
+          find target/central-staging -type f
+        fi
