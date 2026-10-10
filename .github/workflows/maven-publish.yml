@@ -22,36 +22,60 @@ jobs:
         gpg-private-key: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
         gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
-    - name: Publish package
+    - name: Build, sign and stage (skip publishing)
       run: |
         mvn --batch-mode clean deploy \
           -Dgpg.passphrase="${MAVEN_GPG_PASSPHRASE}" \
           -DskipTests \
-          -Daether.generatedMetadata.skip=true \
-          -Daether.artifactResolver.trackingFile.enabled=false
+          -DskipPublishing=true
       env:
         MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
         MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
         MAVEN_GPG_PASSPHRASE: ${{ secrets.OSSRH_GPG_PASSPHRASE }}
 
-    - name: Inspect bundle contents on failure
-      if: failure()
+    - name: Clean dirty files and rebuild bundle
       run: |
-        echo "=== Bundle zip contents ==="
-        if [ -f target/central-publishing/central-bundle.zip ]; then
-          unzip -l target/central-publishing/central-bundle.zip
-        else
-          echo "No bundle zip found"
-        fi
+        echo "=== Before cleanup ==="
+        find target/central-staging -type f | sort
+        echo ""
+        echo "=== Cleaning dirty files (_remote.repositories, maven-metadata-local.xml) ==="
+        find target/central-staging -name "_remote.repositories*" -delete
+        find target/central-staging -name "maven-metadata-local.xml*" -delete
+        find target/central-staging -name "maven-metadata.xml*" -delete
+        echo ""
+        echo "=== After cleanup ==="
+        find target/central-staging -type f | sort
+        echo ""
+        echo "=== Rebuilding clean central-bundle.zip ==="
+        rm -f target/central-publishing/central-bundle.zip
+        rm -f target/central-staging/central-bundle.zip
+        mkdir -p target/central-publishing
+        cd target/central-staging
+        zip -r ../central-publishing/central-bundle.zip com
+        cd ../..
+        echo ""
+        echo "=== Final bundle contents ==="
+        unzip -l target/central-publishing/central-bundle.zip
 
-    - name: Clean bundle and republish on first failure
-      if: failure()
+    - name: Upload bundle to Central Portal
       run: |
-        echo "=== Attempting to clean bundle and republish ==="
-        # 清理 central-staging 中的脏文件
-        if [ -d target/central-staging ]; then
-          find target/central-staging -name "_remote.repositories*" -delete
-          find target/central-staging -name "maven-metadata-local.xml*" -delete
-          echo "Cleaned staging dir, files remaining:"
-          find target/central-staging -type f
+        BEARER_TOKEN=$(printf "%s:%s" "${MAVEN_USERNAME}" "${MAVEN_PASSWORD}" | base64 -w0)
+        HTTP_CODE=$(curl --silent --output /tmp/upload_response.txt --write-out "%{http_code}" \
+          --request POST \
+          --header "Authorization: Bearer ${BEARER_TOKEN}" \
+          --form bundle=@target/central-publishing/central-bundle.zip \
+          "https://central.sonatype.com/api/v1/publisher/upload?name=tencentcloud-agentobs-sdk-agentscope-java-0.0.2&publishingType=AUTOMATIC")
+        echo "HTTP response code: ${HTTP_CODE}"
+        echo "Response body:"
+        cat /tmp/upload_response.txt
+        echo ""
+        if [ "${HTTP_CODE}" != "201" ] && [ "${HTTP_CODE}" != "200" ]; then
+          echo "Upload failed with HTTP ${HTTP_CODE}"
+          exit 1
         fi
+        DEPLOYMENT_ID=$(cat /tmp/upload_response.txt | tr -d '"')
+        echo "Deployment ID: ${DEPLOYMENT_ID}"
+        echo "Deployment uploaded successfully. Central Portal will auto-publish."
+      env:
+        MAVEN_USERNAME: ${{ secrets.OSSRH_USERNAME }}
+        MAVEN_PASSWORD: ${{ secrets.OSSRH_TOKEN }}
