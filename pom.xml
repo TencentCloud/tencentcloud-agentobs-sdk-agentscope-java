@@ -6,7 +6,7 @@
 
     <groupId>com.tencentcloudapi.observability</groupId>
     <artifactId>tencentcloud-agentobs-sdk-agentscope-java</artifactId>
-    <version>0.0.1</version>
+    <version>0.0.2</version>
     <packaging>jar</packaging>
 
     <name>tencentcloud-agentobs-sdk-agentscope-java</name>
