@@ -110,6 +110,12 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
     private static final String TURN_STATE_KEY = ClsTracingMiddleware.class.getName() + ".turnState";
     /** Reactor Context key under which the active {@link StepState} is published. */
     private static final String STEP_STATE_KEY = ClsTracingMiddleware.class.getName() + ".stepState";
+    /**
+     * 自定义 Reactor Context key，用于直接传递 OTel Context，避免依赖
+     * {@link ContextPropagationOperator} 的 store/get 机制（该机制在未初始化或
+     * 与第三方框架混用时可能失效，导致 span 父子关系断裂）。
+     */
+    private static final String OTEL_CONTEXT_KEY = ClsTracingMiddleware.class.getName() + ".otelContext";
 
     private final Tracer tracer;
 
@@ -201,8 +207,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
             Function<AgentInput, Flux<AgentEvent>> next) {
 
         return Flux.deferContextual(contextView -> guarded(() -> {
-            Context parent = ContextPropagationOperator
-                    .getOpenTelemetryContextFromContextView(contextView, Context.current());
+            Context parent = getOtelContext(contextView);
 
             int turn = turnCounter.incrementAndGet();
             String sid = (ctx != null && notEmpty(ctx.getSessionId()))
@@ -296,8 +301,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                         entry.end();
                     }))
                     .contextWrite(reactorCtx -> reactorCtx.put(TURN_STATE_KEY, ts))
-                    .contextWrite(reactorCtx ->
-                            ContextPropagationOperator.storeOpenTelemetryContext(reactorCtx, agentCtx));
+                    .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, agentCtx));
             return flux;
         }, () -> next.apply(input)));
     }
@@ -370,8 +374,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
 
         return Flux.deferContextual(contextView -> guarded(() -> {
             TurnState ts = turnState(contextView);
-            Context agentCtx = ContextPropagationOperator
-                    .getOpenTelemetryContextFromContextView(contextView, Context.current());
+            Context agentCtx = getOtelContext(contextView);
 
             int round = (ts != null) ? ts.roundCounter.incrementAndGet() : 1;
             String turnId = (ts != null) ? ts.turnId : "";
@@ -422,8 +425,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                         ss.toolResultBuffer.clear();
                     }))
                     .contextWrite(reactorCtx -> reactorCtx.put(STEP_STATE_KEY, ss))
-                    .contextWrite(reactorCtx ->
-                            ContextPropagationOperator.storeOpenTelemetryContext(reactorCtx, stepCtx));
+                    .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, stepCtx));
             return flux;
         }, () -> next.apply(input)));
     }
@@ -457,8 +459,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                     : (ts != null) ? ts.currentStep.get() : null;
             Context stepCtx = (ss != null)
                     ? ss.stepCtx
-                    : ContextPropagationOperator
-                            .getOpenTelemetryContextFromContextView(contextView, Context.current());
+                    : getOtelContext(contextView);
 
             String sessionId = (ts != null) ? ts.sessionId : "";
             String turnId = (ts != null) ? ts.turnId : "";
@@ -599,8 +600,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                     ? ss.stepCtx
                     : (ts != null)
                             ? ts.agentCtx
-                            : ContextPropagationOperator
-                                    .getOpenTelemetryContextFromContextView(contextView, Context.current());
+                            : getOtelContext(contextView);
 
             String sessionId = (ts != null) ? ts.sessionId : "";
             String turnId = (ts != null) ? ts.turnId : "";
@@ -687,8 +687,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                     }
                     chatSpan.end();
                 })
-                .contextWrite(reactorCtx ->
-                        ContextPropagationOperator.storeOpenTelemetryContext(reactorCtx, stepContext));
+                .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, stepContext));
     }
 
     private Flux<AgentEvent> runToolWithSpan(Span span, Context parent, Flux<AgentEvent> flux) {
@@ -704,8 +703,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                     }
                     span.end();
                 })
-                .contextWrite(reactorCtx ->
-                        ContextPropagationOperator.storeOpenTelemetryContext(reactorCtx, spanContext));
+                .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, spanContext));
     }
 
     // ══════════════ Reactor Context accessors ══════════════
@@ -716,6 +714,39 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
 
     private static StepState stepState(reactor.util.context.ContextView cv) {
         return cv.hasKey(STEP_STATE_KEY) ? cv.get(STEP_STATE_KEY) : null;
+    }
+
+    /**
+     * 从 Reactor ContextView 中获取 OTel Context。
+     * 优先从自定义 key {@link #OTEL_CONTEXT_KEY} 读取（不受第三方框架干扰），
+     * 其次尝试 {@link ContextPropagationOperator}（兼容已正确初始化的场景），
+     * 最后 fallback 到 {@link Context#current()}。
+     */
+    private static Context getOtelContext(reactor.util.context.ContextView cv) {
+        if (cv.hasKey(OTEL_CONTEXT_KEY)) {
+            return cv.get(OTEL_CONTEXT_KEY);
+        }
+        try {
+            return ContextPropagationOperator
+                    .getOpenTelemetryContextFromContextView(cv, Context.current());
+        } catch (Throwable t) {
+            return Context.current();
+        }
+    }
+
+    /**
+     * 将 OTel Context 同时存入自定义 key 和 {@link ContextPropagationOperator}。
+     * 双写确保无论下游通过哪种方式读取都能拿到正确的 parent context。
+     */
+    private static reactor.util.context.Context storeOtelContext(
+            reactor.util.context.Context reactorCtx, Context otelCtx) {
+        reactor.util.context.Context updated = reactorCtx.put(OTEL_CONTEXT_KEY, otelCtx);
+        try {
+            updated = ContextPropagationOperator.storeOpenTelemetryContext(updated, otelCtx);
+        } catch (Throwable ignored) {
+            // ContextPropagationOperator 未初始化时会抛异常，忽略即可
+        }
+        return updated;
     }
 
     // ══════════════ helpers ══════════════
