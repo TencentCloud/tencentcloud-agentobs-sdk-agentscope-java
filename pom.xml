@@ -6,7 +6,7 @@
 
     <groupId>com.tencentcloudapi.observability</groupId>
     <artifactId>tencentcloud-agentobs-sdk-agentscope-java</artifactId>
-    <version>0.0.2</version>
+    <version>0.0.4</version>
     <packaging>jar</packaging>
 
     <name>tencentcloud-agentobs-sdk-agentscope-java</name>
@@ -48,7 +48,7 @@
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
 
         <opentelemetry.version>1.61.0</opentelemetry.version>
-        <agentscope.version>2.0.0</agentscope.version>
+        <agentscope.version>2.0.1</agentscope.version>
         <jackson.version>2.17.2</jackson.version>
         <slf4j.version>2.0.13</slf4j.version>
         <reactor.version>3.6.6</reactor.version>
@@ -113,18 +113,15 @@
             <optional>true</optional>
         </dependency>
 
-        <!-- OpenTelemetry <-> Reactor context propagation. AgentScope's own
-             OtelTracingMiddleware relies on this to thread the parent otel Context
-             through the reactive pipeline (Context.current() is unreliable across
-             the reactive, multi-threaded execution). We use the SAME mechanism so
-             our invoke_agent -> chat / execute_tool spans share one trace.
-             agentscope-core pulls this at 'compile', so it is present at runtime. -->
+        <!-- OpenTelemetry <-> Reactor context propagation. 本 SDK 把 OTel + Reactor
+             上下文传播桥一并 shade 到 jar 内部（相对于 io.opentelemetry 一起 relocate），
+             这样我们的 Tracer/Context 完全脱离客户 JVM 中其他 OTel 生产者（Aliyun ARMS
+             javaagent、agentscope 自带的 OtelTracingMiddleware 等）的字节码干扰。
+             因此这里不再是 provided，而是打进本 jar 并被 shade。 -->
         <dependency>
             <groupId>io.opentelemetry.instrumentation</groupId>
             <artifactId>opentelemetry-reactor-3.1</artifactId>
             <version>2.27.0-alpha</version>
-            <scope>provided</scope>
-            <optional>true</optional>
         </dependency>
 
         <!-- Test -->
@@ -170,6 +167,84 @@
                         <goals>
                             <goal>jar-no-fork</goal>
                         </goals>
+                    </execution>
+                </executions>
+            </plugin>
+            <!--
+              关键：把 OpenTelemetry 相关类（含 context / api / sdk / exporter / reactor 桥）
+              以及它们的网络传输层传递依赖（OkHttp / okio / protobuf）relocate 到
+              com.tencentcloudapi.observability.shaded.* 下。
+
+              目的：让客户 JVM 中并存的其他 OpenTelemetry 生产者（Aliyun ARMS javaagent 的
+              字节码增强、AgentScope 自带的 OtelTracingMiddleware 等）彻底无法通过
+              io.opentelemetry.* 的类名匹配到我们 SDK 内部使用的 Tracer / Context /
+              SpanBuilder —— 既不会劫持我们的 .setParent(ctx)（之前的 trace 断链根因），
+              也不会把彼此的 Reactor Context key 搞混。
+
+              因此本 SDK 发布的 jar 完全自洽，客户无需添加任何 JVM 启动参数即可工作。
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-shade-plugin</artifactId>
+                <version>3.5.3</version>
+                <executions>
+                    <execution>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>shade</goal>
+                        </goals>
+                        <configuration>
+                            <!-- 发布的 pom 中剔除已被打进 jar 的依赖；agentscope-core /
+                                 reactor-core / slf4j-api / jackson 等不被 shade 的依赖
+                                 保留原状。 -->
+                            <createDependencyReducedPom>true</createDependencyReducedPom>
+                            <!-- 直接替换主 artifact，GPG / 发布流程无需调整 -->
+                            <shadedArtifactAttached>false</shadedArtifactAttached>
+                            <!-- 不要为了 shade 污染客户 IDE 的符号表 -->
+                            <minimizeJar>false</minimizeJar>
+                            <relocations>
+                                <relocation>
+                                    <pattern>io.opentelemetry</pattern>
+                                    <shadedPattern>com.tencentcloudapi.observability.shaded.io.opentelemetry</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>okhttp3</pattern>
+                                    <shadedPattern>com.tencentcloudapi.observability.shaded.okhttp3</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>okio</pattern>
+                                    <shadedPattern>com.tencentcloudapi.observability.shaded.okio</shadedPattern>
+                                </relocation>
+                                <relocation>
+                                    <pattern>com.google.protobuf</pattern>
+                                    <shadedPattern>com.tencentcloudapi.observability.shaded.com.google.protobuf</shadedPattern>
+                                </relocation>
+                            </relocations>
+                            <transformers>
+                                <!-- 自动改写 META-INF/services/* 下的 SPI 文件内容
+                                     （类名跟着 relocation 一起改） -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <!-- 合并 LICENSE / NOTICE，避免签名冲突 -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer">
+                                    <addHeader>false</addHeader>
+                                </transformer>
+                            </transformers>
+                            <filters>
+                                <!-- 丢掉第三方 jar 的签名文件（否则重新打包后签名失效，
+                                     JVM 加载会抛 SecurityException） -->
+                                <filter>
+                                    <artifact>*:*</artifact>
+                                    <excludes>
+                                        <exclude>META-INF/*.SF</exclude>
+                                        <exclude>META-INF/*.DSA</exclude>
+                                        <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/versions/9/module-info.class</exclude>
+                                        <exclude>module-info.class</exclude>
+                                    </excludes>
+                                </filter>
+                            </filters>
+                        </configuration>
                     </execution>
                 </executions>
             </plugin>

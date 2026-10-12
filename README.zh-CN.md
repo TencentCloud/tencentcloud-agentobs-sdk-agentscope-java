@@ -193,6 +193,50 @@ AgentScope（`io.agentscope:agentscope-core`）与 `reactor-core` 声明为 `pro
 > **注意：** 源码使用了 Java 17+ 语法特性（`instanceof` 模式匹配），
 > 请使用 JDK 17 或更高版本构建。
 
+## 与 Aliyun ARMS Java Agent 共存（及其他 OTel javaagent）
+
+从 **0.0.4** 开始，本 SDK 发布的 jar 内部已经 shade 了 OpenTelemetry 运行时 —— 所有
+`io.opentelemetry.*` 类都被重定位到 `com.tencentcloudapi.observability.shaded.io.opentelemetry.*`
+（OTLP/HTTP exporter 依赖的 OkHttp / okio 也一并打包）。
+
+### 为什么要这样做
+
+如果你的应用是通过 OpenTelemetry Java agent 启动的 —— 比如 Aliyun ARMS
+（`-javaagent:aliyun-java-agent.jar`）、DataDog APM、Dynatrace OneAgent 等 ——
+该 agent 会在字节码层增强 `io.opentelemetry.api.trace.Tracer`：所有
+`tracer.spanBuilder(name).setParent(ctx).startSpan()` 调用都会被静默重定向到 agent
+的内部 tracer，而且这个 tracer **忽略你显式传入的 `.setParent(ctx)`**。CLS 侧看到的
+结果就是：一堆孤儿单 span 的 "trace"，每一条 span 都声称自己是根节点，
+`enter_application → invoke_agent → react → chat / tool` 的父子树完全丢失。
+
+由于本 SDK shade 后的 Tracer 类名是 `com.tencentcloudapi.observability.shaded.io.opentelemetry.api.trace.Tracer`，
+Aliyun agent 的字节码匹配器（只匹配 `io.opentelemetry.*`）**根本找不到我们的类**，
+对我们的代码路径不生效。两套 tracing 栈在同一个 JVM 内物理隔离、互不干扰。
+
+### 对客户使用的影响
+
+| 能力 | 0.0.3 及更早 | **0.0.4+（已 shade）** |
+|---|---|---|
+| 启动参数 | 必须加 `-Dotel.instrumentation.opentelemetry-api.enabled=false` | **无需任何改动** |
+| CLS 侧 trace 完整性 | ✅（仅在加参数后） | ✅ |
+| Aliyun ARMS 的 JVM / HTTP / DB / 中间件自动埋点 | ✅ | ✅ |
+| 同时保留 AgentScope 自带的 `OtelTracingMiddleware` | ⚠️ 加参数后在 `AgentContextWrapper.get()` 抛 NPE | ✅ 洁净共存 —— 它照常上报 ARMS，我们照常上报 CLS |
+| Jar 体积 | ~30 KB | ~7.6 MB（内嵌 OTel 运行时） |
+
+### 使用注意
+
+- shade 后的 SDK 完全在进程内运行它自己的 OTel 流水线，**对 `GlobalOpenTelemetry` 和宿主 javaagent 均不可见**。
+  这是刻意为之的。如果你有代码依赖 `GlobalOpenTelemetry.get().getTracer(...)` 来接收我们产生的 span，
+  这条路径不再成立 —— 但在有竞争性 javaagent 的进程里，这条路径本身也不可靠。
+- 本 SDK 的 middleware 使用自己的 Reactor Context key 做 OTel Context 传播；
+  我们的 `invoke_agent → chat / execute_tool` span 组成一棵独立的 trace，
+  不受宿主应用或 AgentScope 自带 `OtelTracingMiddleware` 传播的 context 影响。
+
+> **从 0.0.3 升级到 0.0.4**：请把 `JAVA_OPTS` 里的
+> `-Dotel.instrumentation.opentelemetry-api.enabled=false` 删掉，然后把依赖版本升到 `0.0.4`。
+> `ClsTracingMiddleware`（上报 CLS）与 AgentScope 自带的 `OtelTracingMiddleware`（上报 ARMS）
+> 可以在同一个 agent middleware 链上并存，无需任何额外配置。
+
 ## 示例
 
 | 示例 | 作用 |

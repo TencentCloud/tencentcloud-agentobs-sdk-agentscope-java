@@ -196,6 +196,53 @@ AgentScope (`io.agentscope:agentscope-core`) and `reactor-core` are declared `pr
 > **Note:** the source uses Java 17+ language features (pattern matching for `instanceof`).
 > Build with JDK 17 or newer.
 
+## Interop with Aliyun ARMS Java Agent (and other OTel javaagents)
+
+Starting from **0.0.4**, this SDK ships with its OpenTelemetry runtime shaded — all
+`io.opentelemetry.*` classes are relocated to
+`com.tencentcloudapi.observability.shaded.io.opentelemetry.*` inside the published jar
+(together with the transitive OkHttp / okio dependencies used by the OTLP/HTTP exporter).
+
+### Why this matters
+
+If your application is launched with an OpenTelemetry Java agent — e.g. Aliyun ARMS
+(`-javaagent:aliyun-java-agent.jar`), DataDog APM, or Dynatrace OneAgent — that agent
+instruments `io.opentelemetry.api.trace.Tracer` at bytecode level: calls like
+`tracer.spanBuilder(name).setParent(ctx).startSpan()` are silently redirected to the agent's
+internal tracer, which **ignores the `.setParent(ctx)` you pass**. The result in CLS is a
+flat list of orphaned single-span "traces" — every span claims to be a root, and the
+`enter_application → invoke_agent → react → chat / tool` hierarchy is lost.
+
+Because our shaded Tracer class name is `com.tencentcloudapi.observability.shaded.io.opentelemetry.api.trace.Tracer`,
+the Aliyun agent's bytecode matcher (which only matches `io.opentelemetry.*`) **cannot find
+our classes**, so its instrumentation never fires on our code paths. The two tracing stacks
+coexist in physical isolation.
+
+### Operational effect
+
+| Capability | 0.0.3 and earlier | **0.0.4+ (shaded)** |
+|---|---|---|
+| JVM start flag required | Needed `-Dotel.instrumentation.opentelemetry-api.enabled=false` | **None** — zero changes |
+| CLS trace tree integrity | ✅ (only after the flag) | ✅ |
+| Aliyun ARMS JVM / HTTP / DB / middleware auto-instrumentation | ✅ | ✅ |
+| Keeping AgentScope's built-in `OtelTracingMiddleware` alongside | ⚠️ triggered NPE in `AgentContextWrapper.get()` after the flag | ✅ coexists cleanly — reports to ARMS as usual, we report to CLS |
+| Jar size | ~30 KB | ~7.6 MB (OTel runtime bundled) |
+
+### Caveats
+
+- The shaded SDK runs its OTel pipeline entirely in-process; **nothing of it is visible to
+  `GlobalOpenTelemetry` or to a host javaagent**. This is intentional. If you had code that
+  relied on `GlobalOpenTelemetry.get().getTracer(...)` to receive our spans, that path no
+  longer works — but it never worked reliably with a competing javaagent in place anyway.
+- Our middleware uses its own Reactor Context key for OTel Context propagation; this means
+  our `invoke_agent → chat / execute_tool` spans form a single trace independent of any
+  context propagated by the host app or by AgentScope's own `OtelTracingMiddleware`.
+
+> **Migration from 0.0.3**: delete `-Dotel.instrumentation.opentelemetry-api.enabled=false`
+> from your `JAVA_OPTS` and bump the dependency to `0.0.4`. Both middlewares
+> (`ClsTracingMiddleware` for CLS and AgentScope's `OtelTracingMiddleware` for ARMS) can
+> now coexist without any additional configuration.
+
 ## Examples
 
 | Example | What it does |

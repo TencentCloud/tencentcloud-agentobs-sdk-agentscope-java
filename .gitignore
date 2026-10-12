@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# ---- Local testbench (阿里 javaagent / 本地测试日志, 不入库) ----
+.testbench/
+
 # ---- Maven build output ----
 target/
 pom.xml.tag
