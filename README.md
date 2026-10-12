@@ -1,6 +1,6 @@
 # tencentcloud-agentobs-sdk-agentscope-java
 
-> **English** | [中文](./README.zh-CN.md)
+> **English** | [中文](./README.zh-CN.md) · see also [CHANGELOG](./CHANGELOG.md)
 
 Tencent Cloud CLS observability SDK for **AgentScope Java**.
 
