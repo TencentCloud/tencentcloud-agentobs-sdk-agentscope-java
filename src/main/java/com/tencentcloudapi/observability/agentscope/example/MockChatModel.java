@@ -4,6 +4,7 @@ import io.agentscope.core.message.ContentBlock;
 import io.agentscope.core.message.Msg;
 import io.agentscope.core.message.TextBlock;
 import io.agentscope.core.message.ToolUseBlock;
+import io.agentscope.core.model.ChatModelBase;
 import io.agentscope.core.model.ChatResponse;
 import io.agentscope.core.model.ChatUsage;
 import io.agentscope.core.model.GenerateOptions;
@@ -17,7 +18,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import reactor.core.publisher.Flux;
 
 /**
- * A fully offline mock {@link Model} that drives a real AgentScope {@link io.agentscope.core.ReActAgent}
+ * A fully offline mock model that drives a real AgentScope {@link io.agentscope.core.ReActAgent}
  * through one realistic ReAct loop — <em>without</em> any live LLM or API key.
  *
  * <p><b>Turn 1 (reasoning + acting):</b> returns a {@link ToolUseBlock} that asks the agent to call
@@ -27,11 +28,16 @@ import reactor.core.publisher.Flux;
  * <p><b>Turn 2 (final answer):</b> after the tool result comes back, returns a plain {@link TextBlock}
  * with a natural-language answer and no further tool calls, so the ReAct loop terminates.
  *
- * <p>Because it implements the real {@code Model} interface, the surrounding agent, toolkit,
- * middleware chain, and event stream are 100% genuine AgentScope machinery — only the token
- * generation is faked.
+ * <p>It extends {@link ChatModelBase} — the base every real AgentScope model extends — rather than
+ * implementing {@link Model} directly. That matters for observability: {@code ChatModelBase.stream()}
+ * is {@code final} and routes through AgentScope's {@code TracerRegistry}, which is the only entry
+ * point that also sees model calls made outside the middleware chain (the framework's own memory /
+ * history-summarisation prompts). Implementing {@link Model} bare-handed would bypass it.
+ *
+ * <p>Because it plugs into the real model base class, the surrounding agent, toolkit, middleware
+ * chain, and event stream are 100% genuine AgentScope machinery — only token generation is faked.
  */
-public final class MockChatModel implements Model {
+public final class MockChatModel extends ChatModelBase {
 
     private final String modelName;
     private final String toolName;
@@ -41,6 +47,11 @@ public final class MockChatModel implements Model {
     /** Counts how many times the agent has asked the model to generate. */
     private final AtomicInteger call = new AtomicInteger(0);
 
+    /**
+     * @param toolName the tool round 1 should request; pass {@code null} or an empty string for a
+     *     model that never calls tools and answers directly — the shape of an auxiliary model such
+     *     as the one a memory / summarisation component uses.
+     */
     public MockChatModel(String modelName,
                          String toolName,
                          Map<String, Object> toolArgs,
@@ -57,11 +68,11 @@ public final class MockChatModel implements Model {
     }
 
     @Override
-    public Flux<ChatResponse> stream(List<Msg> messages,
-                                     List<ToolSchema> tools,
-                                     GenerateOptions options) {
+    protected Flux<ChatResponse> doStream(List<Msg> messages,
+                                          List<ToolSchema> tools,
+                                          GenerateOptions options) {
         int round = call.incrementAndGet();
-        if (round == 1) {
+        if (round == 1 && toolName != null && !toolName.isEmpty()) {
             // Round 1: ask the agent to call the weather tool.
             ToolUseBlock toolUse = new ToolUseBlock(
                     "call_mock_0001",

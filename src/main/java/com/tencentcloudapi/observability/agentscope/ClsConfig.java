@@ -37,6 +37,23 @@ public final class ClsConfig {
     public static final String ENV_SOURCE = "CLS_SOURCE";
     public static final String ENV_BATCH_SIZE = "CLS_BATCH_SIZE";
     public static final String ENV_DEBUG = "CLS_DEBUG";
+    /** Set to {@code 0/false/no} to stop tracing model calls the agent middleware never sees. */
+    public static final String ENV_CAPTURE_FRAMEWORK_CALLS = "CLS_CAPTURE_FRAMEWORK_CALLS";
+    /**
+     * Set to {@code 0/false/no} to stop carrying turn context across Reactor {@code Scheduler}
+     * hops. Only affects correlation of framework model calls dispatched as detached
+     * subscriptions; those calls are still traced, just not attached to the originating turn.
+     */
+    public static final String ENV_PROPAGATE_ACROSS_SCHEDULERS =
+            "CLS_PROPAGATE_ACROSS_SCHEDULERS";
+    /**
+     * Set to {@code 1/true/yes} to emit a {@code format} span for each prompt-formatting call.
+     *
+     * <p>Off by default: a formatter runs on every model call, so enabling this roughly doubles
+     * the span count of a turn, and what it records is a re-encoding of the messages already on
+     * the sibling {@code chat} span. Turn it on to debug provider-specific prompt assembly.
+     */
+    public static final String ENV_CAPTURE_FORMAT_CALLS = "CLS_CAPTURE_FORMAT_CALLS";
 
     private static final String DEFAULT_SERVICE_NAME = "agentscope-app";
     private static final int DEFAULT_BATCH_SIZE = 32;
@@ -50,9 +67,14 @@ public final class ClsConfig {
     private final String source;
     private final int batchSize;
     private final boolean debug;
+    private final boolean captureFrameworkModelCalls;
+    private final boolean propagateAcrossSchedulers;
+    private final boolean captureFormatCalls;
 
     private ClsConfig(String endpoint, String topicId, String secretId, String secretKey,
-                      String serviceName, String source, int batchSize, boolean debug) {
+                      String serviceName, String source, int batchSize, boolean debug,
+                      boolean captureFrameworkModelCalls, boolean propagateAcrossSchedulers,
+                      boolean captureFormatCalls) {
         this.endpoint = endpoint;
         this.topicId = topicId;
         this.secretId = secretId;
@@ -61,6 +83,9 @@ public final class ClsConfig {
         this.source = source;
         this.batchSize = batchSize;
         this.debug = debug;
+        this.captureFrameworkModelCalls = captureFrameworkModelCalls;
+        this.propagateAcrossSchedulers = propagateAcrossSchedulers;
+        this.captureFormatCalls = captureFormatCalls;
     }
 
     public String endpoint() {
@@ -93,6 +118,44 @@ public final class ClsConfig {
 
     public boolean debug() {
         return debug;
+    }
+
+    /**
+     * Whether model calls that bypass the agent's middleware chain — the framework's own memory
+     * flush / history summarisation prompts, which call {@code Model.stream()} directly — are
+     * traced by hooking AgentScope's {@code TracerRegistry}. Defaults to {@code true}.
+     */
+    public boolean captureFrameworkModelCalls() {
+        return captureFrameworkModelCalls;
+    }
+
+    /**
+     * Whether the turn context is carried across Reactor {@code Scheduler} hops, via a
+     * {@code Schedulers.onScheduleHook} that snapshots the turn on the submitting thread and
+     * restores it around the task. Defaults to {@code true}.
+     *
+     * <p>This is what correlates a framework model call dispatched as a <em>detached</em>
+     * subscription — {@code Mono.defer(..).subscribeOn(..).subscribe(cb, cb)}, which
+     * {@code agentscope-harness}'s memory flush uses — with the turn that triggered it. Without
+     * it such calls are still traced, but form their own traces whenever more than one session is
+     * in flight.
+     *
+     * <p>The hook is process-wide: every task submitted to any Scheduler passes through it. Tasks
+     * carrying no turn are returned unwrapped after three {@code ThreadLocal} reads, so the cost
+     * to unrelated application code is small but not zero. Turn it off if your deployment cannot
+     * accept a hook on the shared Reactor Schedulers, and accept uncorrelated framework spans.
+     */
+    public boolean propagateAcrossSchedulers() {
+        return propagateAcrossSchedulers;
+    }
+
+    /**
+     * Whether prompt-formatting calls get their own {@code format} span.
+     *
+     * @see #ENV_CAPTURE_FORMAT_CALLS
+     */
+    public boolean captureFormatCalls() {
+        return captureFormatCalls;
     }
 
     /**
@@ -138,6 +201,9 @@ public final class ClsConfig {
         private String source;
         private Integer batchSize;
         private Boolean debug;
+        private Boolean captureFrameworkModelCalls;
+        private Boolean propagateAcrossSchedulers;
+        private Boolean captureFormatCalls;
 
         public Builder endpoint(String endpoint) {
             this.endpoint = endpoint;
@@ -176,6 +242,40 @@ public final class ClsConfig {
 
         public Builder debug(Boolean debug) {
             this.debug = debug;
+            return this;
+        }
+
+        /**
+         * Trace model calls that never enter the agent's middleware chain — the framework's own
+         * memory flush / history summarisation prompts. Enabled by default.
+         */
+        public Builder captureFrameworkModelCalls(Boolean captureFrameworkModelCalls) {
+            this.captureFrameworkModelCalls = captureFrameworkModelCalls;
+            return this;
+        }
+
+        /**
+         * Carry the turn context across Reactor {@code Scheduler} hops, so a framework model call
+         * dispatched as a detached subscription (the framework's post-turn memory flush) is still
+         * attributed to the turn that triggered it. Enabled by default.
+         *
+         * <p>Installs a process-wide {@code Schedulers.onScheduleHook}. Disable to keep the shared
+         * Reactor Schedulers untouched, at the cost of such spans forming their own traces.
+         */
+        public Builder propagateAcrossSchedulers(Boolean propagateAcrossSchedulers) {
+            this.propagateAcrossSchedulers = propagateAcrossSchedulers;
+            return this;
+        }
+
+        /**
+         * Emit a {@code format} span per prompt-formatting call. Disabled by default.
+         *
+         * <p>A formatter runs on every model call, so this roughly doubles a turn's span count
+         * while recording a re-encoding of the messages already on the sibling {@code chat} span.
+         * Enable it when debugging provider-specific prompt assembly.
+         */
+        public Builder captureFormatCalls(Boolean captureFormatCalls) {
+            this.captureFormatCalls = captureFormatCalls;
             return this;
         }
 
@@ -224,6 +324,29 @@ public final class ClsConfig {
                 resolvedDebug = raw.equals("1") || raw.equals("true") || raw.equals("yes");
             }
 
+            boolean resolvedCaptureFrameworkCalls = true;
+            if (captureFrameworkModelCalls != null) {
+                resolvedCaptureFrameworkCalls = captureFrameworkModelCalls;
+            } else {
+                String raw = resolve(null, ENV_CAPTURE_FRAMEWORK_CALLS, envFile, "").toLowerCase();
+                if (!raw.isEmpty()) {
+                    resolvedCaptureFrameworkCalls =
+                            !(raw.equals("0") || raw.equals("false") || raw.equals("no"));
+                }
+            }
+
+            boolean resolvedPropagateAcrossSchedulers = true;
+            if (propagateAcrossSchedulers != null) {
+                resolvedPropagateAcrossSchedulers = propagateAcrossSchedulers;
+            } else {
+                String raw = resolve(null, ENV_PROPAGATE_ACROSS_SCHEDULERS, envFile, "")
+                        .toLowerCase();
+                if (!raw.isEmpty()) {
+                    resolvedPropagateAcrossSchedulers =
+                            !(raw.equals("0") || raw.equals("false") || raw.equals("no"));
+                }
+            }
+
             StringBuilder missing = new StringBuilder();
             if (resolvedEndpoint.isEmpty()) {
                 missing.append("\n    ").append(ENV_ENDPOINT);
@@ -248,9 +371,19 @@ public final class ClsConfig {
                                 + ".topicId(...).secretId(...).secretKey(...).build()");
             }
 
+            boolean resolvedCaptureFormatCalls = false;
+            if (captureFormatCalls != null) {
+                resolvedCaptureFormatCalls = captureFormatCalls;
+            } else {
+                String raw = resolve(null, ENV_CAPTURE_FORMAT_CALLS, envFile, "").toLowerCase();
+                resolvedCaptureFormatCalls =
+                        raw.equals("1") || raw.equals("true") || raw.equals("yes");
+            }
+
             return new ClsConfig(resolvedEndpoint, resolvedTopicId, resolvedSecretId,
                     resolvedSecretKey, resolvedServiceName, resolvedSource, resolvedBatchSize,
-                    resolvedDebug);
+                    resolvedDebug, resolvedCaptureFrameworkCalls,
+                    resolvedPropagateAcrossSchedulers, resolvedCaptureFormatCalls);
         }
     }
 

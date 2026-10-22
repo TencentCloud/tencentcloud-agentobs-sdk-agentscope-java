@@ -27,11 +27,15 @@ import io.agentscope.core.middleware.MiddlewareBase;
 import io.agentscope.core.middleware.ModelCallInput;
 import io.agentscope.core.middleware.ReasoningInput;
 import io.agentscope.core.model.ChatUsage;
+import io.agentscope.core.model.GenerateOptions;
+import io.agentscope.core.model.ToolSchema;
+import io.agentscope.core.tool.Toolkit;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import io.opentelemetry.api.trace.Span;
+import io.opentelemetry.api.trace.SpanContext;
 import io.opentelemetry.api.trace.SpanKind;
 import io.opentelemetry.api.trace.StatusCode;
 import io.opentelemetry.api.trace.Tracer;
@@ -116,11 +120,189 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
      * 与第三方框架混用时可能失效，导致 span 父子关系断裂）。
      */
     private static final String OTEL_CONTEXT_KEY = ClsTracingMiddleware.class.getName() + ".otelContext";
+    /**
+     * Marker published on the Reactor Context while {@link #onModelCall} owns a model call.
+     *
+     * <p>{@link ClsFrameworkTracer} hooks the framework's lowest-level model entry
+     * ({@code ChatModelBase.stream()}), which ALSO carries the agent's regular model calls.
+     * Because the Reactor Context propagates from downstream to upstream at subscription time,
+     * the model Flux created inside {@code onModelCall}'s {@code next.apply(...)} sees this key
+     * and the framework tracer stays silent — leaving exactly one {@code chat} span per call.
+     * Model calls issued outside any middleware chain (memory flush / history summarisation,
+     * which call {@code Model.stream()} directly) carry no marker and are traced by the tracer.
+     */
+    static final String MODEL_CALL_MARK_KEY = ClsTracingMiddleware.class.getName() + ".modelCall";
 
     private final Tracer tracer;
 
     /** Turn sequence, the only shared mutable state — a monotonic id source, safe to share. */
     private final AtomicInteger turnCounter = new AtomicInteger(0);
+
+    // ── ThreadLocal bridge for Mono.block() callers ──
+    //
+    // TracerRegistry's Hooks.onEachOperator wraps every Reactor signal with
+    //   tracer.runWithContext(contextView, () -> actual.onNext(t))
+    // ClsFrameworkTracer.runWithContext stores the turn state + OTel context into
+    // these ThreadLocals BEFORE the supplier runs. So when a component makes a
+    // synchronous model call from inside signal processing — Mono.block() starts a
+    // fresh subscription with no Reactor Context — the ThreadLocals are still set.
+    // resolveExternalCallSite checks them as fallback. (A call dispatched onto a
+    // Scheduler instead is covered by the snapshot in TurnSnapshot.)
+    private static final ThreadLocal<TurnState> THREAD_TURN = new ThreadLocal<>();
+    private static final ThreadLocal<StepState> THREAD_STEP = new ThreadLocal<>();
+
+    /**
+     * Turn identity carried INSIDE the OpenTelemetry Context.
+     *
+     * <p>{@link TurnState} lives in the Reactor Context and in ThreadLocals, neither of which
+     * survives a hop onto an unrelated thread. An OTel {@link Context} does: it is immutable and
+     * propagates wherever the host (or an OTel context-propagating executor, or a java agent)
+     * makes it current. Publishing {@code sessionId/turnId/stepId} here means a model call that
+     * reaches us with only {@code Context.current()} available — a detached memory flush, for
+     * instance — can still be attributed to its turn rather than becoming an orphan trace.
+     */
+    private static final io.opentelemetry.context.ContextKey<String[]> OTEL_TURN_IDS_KEY =
+            io.opentelemetry.context.ContextKey.named("cls.gen_ai.turn_ids");
+
+    /** Pack turn identity into an OTel context so it survives arbitrary thread hops. */
+    private static Context withTurnIds(Context ctx, String sessionId, String turnId,
+                                       String stepId) {
+        return ctx.with(OTEL_TURN_IDS_KEY,
+                new String[]{safe(sessionId), safe(turnId), safe(stepId)});
+    }
+
+    /**
+     * Last turn seen per session, kept alive AFTER the turn's Flux terminates.
+     *
+     * <p>Context propagation (Reactor Context / ThreadLocal / OTel Context) only works while the
+     * turn is still on the stack. But the framework's memory extraction routinely runs <em>after
+     * the agent has replied</em> — it summarises the conversation that just finished, often on its
+     * own thread. At that point every propagation channel is already gone, which is why such spans
+     * used to become orphan traces.
+     *
+     * <p>This index is the fallback that fixes it: the owning {@code session.id} is almost always
+     * still derivable (the memory component runs inside the same session's processing), so a model
+     * call with no live context is attached to that session's most recent turn. This is how a
+     * post-turn memory span lands under {@code invoke_agent} instead of starting a new trace.
+     *
+     * <p>Bounded and self-evicting — see {@link #rememberTurn}. Entries also expire by age so a
+     * long-lived process cannot accumulate stale turns, and a model call arriving long after its
+     * turn is treated as unrelated rather than being misattributed.
+     */
+    private static final Map<String, TurnState> LAST_TURN_BY_SESSION = new ConcurrentHashMap<>();
+
+    /** Upper bound on {@link #LAST_TURN_BY_SESSION}; oldest entries are dropped past this. */
+    private static final int MAX_TRACKED_SESSIONS = 1024;
+
+    /**
+     * How long a finished turn stays attachable. Memory extraction fires seconds after the reply;
+     * beyond this window a model call is almost certainly unrelated and gets its own trace.
+     */
+    private static final long TURN_ATTACH_TTL_NANOS = java.time.Duration.ofMinutes(2).toNanos();
+
+    /** Record a turn as the session's most recent, evicting stale//excess entries. */
+    private static void rememberTurn(TurnState ts) {
+        if (!notEmpty(ts.sessionId)) {
+            return;
+        }
+        LAST_TURN_BY_SESSION.put(ts.sessionId, ts);
+        if (LAST_TURN_BY_SESSION.size() > MAX_TRACKED_SESSIONS) {
+            long now = System.nanoTime();
+            LAST_TURN_BY_SESSION.entrySet().removeIf(
+                    e -> now - e.getValue().createdNanos > TURN_ATTACH_TTL_NANOS);
+            // Still oversized (many concurrent fresh sessions): drop the oldest half.
+            if (LAST_TURN_BY_SESSION.size() > MAX_TRACKED_SESSIONS) {
+                LAST_TURN_BY_SESSION.entrySet().stream()
+                        .sorted(java.util.Comparator.comparingLong(e -> e.getValue().createdNanos))
+                        .limit(LAST_TURN_BY_SESSION.size() - MAX_TRACKED_SESSIONS / 2)
+                        .map(Map.Entry::getKey)
+                        .forEach(LAST_TURN_BY_SESSION::remove);
+            }
+        }
+    }
+
+    /** The session's most recent turn, if still within the attach window. */
+    private static TurnState recentTurnForSession(String sessionId) {
+        if (!notEmpty(sessionId)) {
+            return null;
+        }
+        TurnState ts = LAST_TURN_BY_SESSION.get(sessionId);
+        if (ts == null) {
+            return null;
+        }
+        if (System.nanoTime() - ts.createdNanos > TURN_ATTACH_TTL_NANOS) {
+            LAST_TURN_BY_SESSION.remove(sessionId, ts);
+            return null;
+        }
+        return ts;
+    }
+
+    /**
+     * The single turn in flight, or {@code null} when zero or several sessions are being tracked.
+     *
+     * <p>Used only when the thread gives no hint — e.g. memory extraction dispatched onto a pool
+     * thread that never served a turn. With exactly one session active the attribution is
+     * unambiguous, which covers single-user apps, CLI tools and the common single-tenant service.
+     * With several concurrent sessions this deliberately returns {@code null} rather than guess,
+     * so a busy multi-tenant server never cross-attributes one user's memory call to another.
+     */
+    private static TurnState soleTrackedTurn() {
+        if (LAST_TURN_BY_SESSION.size() != 1) {
+            return null;
+        }
+        java.util.Iterator<TurnState> it = LAST_TURN_BY_SESSION.values().iterator();
+        if (!it.hasNext()) {
+            return null;
+        }
+        TurnState ts = it.next();
+        return (System.nanoTime() - ts.createdNanos > TURN_ATTACH_TTL_NANOS) ? null : ts;
+    }
+
+    /**
+     * Session id of the turn most recently active on this thread, surviving turn completion.
+     *
+     * <p>Memory extraction usually runs on the same thread that just finished the turn (or one it
+     * spawned synchronously), so this is the key that lets a post-turn call find its session.
+     */
+    private static final ThreadLocal<String> THREAD_LAST_SESSION = new ThreadLocal<>();
+
+    /**
+     * Drop all post-turn attachment state. Only needed by tests, which share one JVM across
+     * cases and would otherwise see one case's finished turn adopt the next case's memory call.
+     */
+    static void resetSessionIndexForTesting() {
+        LAST_TURN_BY_SESSION.clear();
+        THREAD_LAST_SESSION.remove();
+        THREAD_TURN.remove();
+        THREAD_STEP.remove();
+        THREAD_SNAPSHOT.remove();
+    }
+
+    /**
+     * The OTel Context of the turn currently in scope, or {@code null} when no turn is active.
+     *
+     * <p>Exposed so a host that dispatches memory/summarisation work onto its own executor can
+     * propagate it explicitly and keep those spans on the turn's trace:
+     * <pre>{@code
+     * Context turnCtx = ClsTracingMiddleware.currentTurnOtelContext();
+     * executor.submit(() -> {
+     *     try (Scope ignored = turnCtx.makeCurrent()) {
+     *         memory.compressIfNeeded();
+     *     }
+     * });
+     * }</pre>
+     */
+    public static Context currentTurnOtelContext() {
+        StepState ss = THREAD_STEP.get();
+        TurnState ts = THREAD_TURN.get();
+        if (ss == null && ts != null) {
+            ss = liveStep(ts);
+        }
+        if (ss != null) {
+            return ss.stepCtx;
+        }
+        return ts != null ? ts.agentCtx : null;
+    }
 
     public ClsTracingMiddleware(Tracer tracer) {
         this.tracer = tracer;
@@ -144,6 +326,12 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
         final AtomicLong sumCacheReadTokens = new AtomicLong();
         final AtomicInteger roundCounter = new AtomicInteger();
         final AtomicInteger toolCallCount = new AtomicInteger();
+        /**
+         * Sequence for steps synthesised around model calls that bypass the middleware chain.
+         * Separate from {@link #roundCounter} — those calls are not ReAct rounds, and sharing the
+         * counter would shift {@code gen_ai.react.round} for the real rounds.
+         */
+        final AtomicInteger frameworkStepCounter = new AtomicInteger();
         volatile String lastAssistantText = "";
         volatile String finishReason = "normal";
 
@@ -155,6 +343,9 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
          * ended when the next round's step opens, or when the turn finishes.
          */
         final AtomicReference<StepState> currentStep = new AtomicReference<>();
+
+        /** Creation timestamp, used to expire entries from {@link #LAST_TURN_BY_SESSION}. */
+        final long createdNanos = System.nanoTime();
 
         /**
          * Precise {@code toolCallId → owning step} index. When a model call in a given round emits
@@ -189,12 +380,29 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
         final Map<String, StringBuilder> outputBuffer = new ConcurrentHashMap<>();
         /** streamed tool result text, keyed by toolCallId */
         final Map<String, StringBuilder> toolResultBuffer = new ConcurrentHashMap<>();
+        /**
+         * Set once this round's {@code onReasoning} Flux has terminated.
+         *
+         * <p>The step span deliberately outlives that Flux — it stays open so the tool executed in
+         * the same round can nest under it, and is closed only when the next round opens or the
+         * turn ends. So "{@code currentStep} is non-null" does NOT mean a round is in flight: after
+         * the last round, {@link TurnState#currentStep} still points at it for the whole
+         * {@code doFinally}/{@code doOnComplete} tail of the turn. Work handed off there (the
+         * framework's post-turn memory flush) must NOT be filed as part of that round, so this
+         * flag is what distinguishes "still reasoning" from "kept open awaiting a tool".
+         */
+        final AtomicBoolean reasoningDone = new AtomicBoolean();
 
         StepState(String stepId, int round, Span stepSpan, Context stepCtx) {
             this.stepId = stepId;
             this.round = round;
             this.stepSpan = stepSpan;
             this.stepCtx = stepCtx;
+        }
+
+        /** True while this round's reasoning is still running, i.e. safe to adopt as parent. */
+        boolean isLive() {
+            return !reasoningDone.get();
         }
     }
 
@@ -247,35 +455,42 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
             if (agent != null && notEmpty(agent.getAgentId())) {
                 agentSpan.setAttribute("gen_ai.agent.id", safe(agent.getAgentId()));
             }
+            if (agent != null) {
+                String description = agentDescription(agent);
+                if (notEmpty(description)) {
+                    agentSpan.setAttribute("gen_ai.agent.description", description);
+                }
+            }
             if (notEmpty(userId)) {
                 agentSpan.setAttribute("gen_ai.user.id", userId);
             }
             agentSpan.setAttribute("gen_ai.input.messages", inputMsgsJson);
-            Context agentCtx = entryCtx.with(agentSpan);
+            // Carry turn identity in the OTel Context too, so a model call that only has
+            // Context.current() (detached memory flush) can still be attributed to this turn.
+            Context agentCtx = withTurnIds(entryCtx.with(agentSpan), sid, turnId, "");
 
             TurnState ts = new TurnState(sid, turnId, userId, entry, agentSpan, agentCtx);
+            // Index the turn by session so a model call arriving AFTER this turn finishes — the
+            // framework's memory extraction summarises the conversation that just ended — can
+            // still be attached to it instead of starting an orphan trace.
+            rememberTurn(ts);
+            THREAD_LAST_SESSION.set(sid);
 
             debugSpan("entry", entry, parent);
             debugSpan("agent", agentSpan, entryCtx);
 
-            Flux<AgentEvent> flux = next.apply(input)
-                    .doOnNext(ev -> safely("onAgent.event",
-                            () -> observeAgentEvent(ts, agentCtx, ev)))
-                    .doOnError(err -> safely("onAgent.error", () -> {
-                        agentSpan.recordException(err);
-                        agentSpan.setStatus(StatusCode.ERROR, safe(err.getMessage()));
-                        entry.recordException(err);
-                        entry.setStatus(StatusCode.ERROR, safe(err.getMessage()));
-                        ts.finishReason = "error";
-                    }))
-                    .doFinally(sig -> safely("onAgent.finally", () -> {
-                        if (sig == SignalType.CANCEL && "normal".equals(ts.finishReason)) {
+            AtomicBoolean turnClosed = new AtomicBoolean();
+            java.util.function.Consumer<Boolean> closeTurn = cancelled ->
+                    safely("onAgent.end", () -> {
+                        if (!turnClosed.compareAndSet(false, true)) {
+                            return;
+                        }
+                        if (cancelled && "normal".equals(ts.finishReason)) {
                             ts.finishReason = "interrupted";
                         }
                         // Close the last round's step span, which is deliberately kept open past
                         // its own onReasoning Flux so the round's tool span could nest under it.
-                        closeStep(ts, ts.currentStep.getAndSet(null),
-                                sig == SignalType.CANCEL);
+                        closeStep(ts, ts.currentStep.getAndSet(null), cancelled);
                         ts.toolCallStepIndex.clear();
                         boolean parked = "awaiting_user_confirm".equals(ts.finishReason)
                                 || "external_execution".equals(ts.finishReason);
@@ -299,7 +514,23 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                         entry.setAttribute("gen_ai.turn.completed", !parked);
                         entry.setAttribute("gen_ai.output.messages", outJson);
                         entry.end();
+                    });
+
+            Flux<AgentEvent> flux = next.apply(input)
+                    .doOnNext(ev -> safely("onAgent.event",
+                            () -> observeAgentEvent(ts, agentCtx, ev)))
+                    .doOnError(err -> safely("onAgent.error", () -> {
+                        agentSpan.recordException(err);
+                        agentSpan.setStatus(StatusCode.ERROR, safe(err.getMessage()));
+                        entry.recordException(err);
+                        entry.setStatus(StatusCode.ERROR, safe(err.getMessage()));
+                        ts.finishReason = "error";
                     }))
+                    // doOnTerminate, not doFinally: the turn's spans must be ended BEFORE
+                    // agent.call(...).block() returns, otherwise an application that flushes and
+                    // shuts down right after the call loses them. See endOnceBefore.
+                    .doOnTerminate(() -> closeTurn.accept(false))
+                    .doOnCancel(() -> closeTurn.accept(true))
                     .contextWrite(reactorCtx -> reactorCtx.put(TURN_STATE_KEY, ts))
                     .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, agentCtx));
             return flux;
@@ -364,6 +595,62 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
         }
     }
 
+    /**
+     * The agent's configured self-description — its role, which is what tells one agent apart from
+     * another in a multi-agent trace where names are generic.
+     *
+     * <p><b>Returns {@code ""} when the agent has none.</b> {@code Agent.getDescription()} is a
+     * {@code default} method that, when unset, synthesises {@code "Agent({agentId}) {name}"} — so
+     * it never returns null and a naive copy writes a value for every agent. That value is pure
+     * noise: it restates {@code gen_ai.agent.id} and {@code gen_ai.agent.name}, which are already
+     * on the same span, while making a trace look as though the field were populated. Verified
+     * against a real {@code ReActAgent} with no description configured.
+     *
+     * @return the configured description, or {@code ""} if absent or merely the synthesised default
+     */
+    private static String agentDescription(Agent agent) {
+        String description = safely("onAgent.description", agent::getDescription, "");
+        if (!notEmpty(description)) {
+            return "";
+        }
+        String synthesised = "Agent(" + safe(safely("onAgent.agentId", agent::getAgentId, ""))
+                + ") " + safe(safely("onAgent.name", agent::getName, ""));
+        return description.equals(synthesised) ? "" : description;
+    }
+
+    /**
+     * The invoked tool's declared description, looked up on the agent's toolkit.
+     *
+     * <p>It answers a question the call record alone cannot: whether the model picked the wrong
+     * tool, or the right tool whose description misled it. Resolved by name because
+     * {@link ActingInput} carries only {@link ToolUseBlock}s — the schemas live on the toolkit.
+     *
+     * @return the description, or {@code ""} when unavailable
+     */
+    private static String toolDescription(Agent agent, String toolName) {
+        if (agent == null || !notEmpty(toolName)) {
+            return "";
+        }
+        return safely("onActing.toolDescription", () -> {
+            // Both getToolkit() and the per-name lookup are host code reached through a default
+            // interface method, so neither is assumed to be present or well-behaved.
+            Toolkit toolkit = agent.getToolkit();
+            if (toolkit == null) {
+                return "";
+            }
+            List<ToolSchema> schemas = toolkit.getToolSchemas(List.of(toolName));
+            if (schemas == null) {
+                return "";
+            }
+            for (ToolSchema s : schemas) {
+                if (s != null && toolName.equals(s.getName()) && notEmpty(s.getDescription())) {
+                    return s.getDescription();
+                }
+            }
+            return "";
+        }, "");
+    }
+
     // ══════════════ step (one ReAct round) ══════════════
     @Override
     public Flux<AgentEvent> onReasoning(
@@ -394,7 +681,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
             if (input != null && input.messages() != null) {
                 step.setAttribute("gen_ai.input.messages", msgListToJson(input.messages()));
             }
-            Context stepCtx = agentCtx.with(step);
+            Context stepCtx = withTurnIds(agentCtx.with(step), sessionId, turnId, stepId);
             StepState ss = new StepState(stepId, round, step, stepCtx);
 
             // Promote this step to turn scope and close the PREVIOUS round's step span (kept open
@@ -410,12 +697,22 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                         step.recordException(err);
                         step.setStatus(StatusCode.ERROR, safe(err.getMessage()));
                     }))
+                    // Mark reasoning finished BEFORE the terminal signal reaches downstream.
+                    // doFinally would be too late: it runs after propagation, so an outer
+                    // doOnComplete (which is how harness's MemoryFlushMiddleware schedules its
+                    // post-turn memory flush) would still see this round as live and the flush
+                    // would be filed as part of it.
+                    .doOnTerminate(() -> safely("onReasoning.terminate",
+                            () -> ss.reasoningDone.set(true)))
+                    .doOnCancel(() -> safely("onReasoning.cancel",
+                            () -> ss.reasoningDone.set(true)))
                     .doFinally(sig -> safely("onReasoning.finally", () -> {
                         // NOTE: the step span is intentionally NOT ended here. In a real ReAct
                         // loop onActing runs AFTER this reasoning Flux completes and is not on its
                         // downstream, so ending the span now would orphan the tool span onto the
                         // agent. The span is closed when the next round opens or the turn ends
                         // (see closeStep). Here we only mark cancellation and drop stream buffers.
+                        ss.reasoningDone.set(true);
                         if (sig == SignalType.CANCEL) {
                             step.setAttribute("gen_ai.react.finish_reason", "interrupted");
                             step.setAttribute("gen_ai.incomplete", true);
@@ -485,14 +782,41 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
             if (notEmpty(model)) {
                 chat.setAttribute("gen_ai.request.model", model);
             }
-            if (input != null && input.messages() != null) {
-                chat.setAttribute("gen_ai.input.messages", msgListToJson(input.messages()));
+            if (input != null) {
+                applyModelRequest(chat, input.messages(), input.tools(), input.options());
+                String provider = providerName(input.model());
+                if (notEmpty(provider)) {
+                    chat.setAttribute("gen_ai.provider.name", provider);
+                }
             }
 
             AtomicBoolean sawToolCall = new AtomicBoolean(false);
+            final long chatStartNanos = System.nanoTime();
+            final AtomicBoolean firstTokenSeen = new AtomicBoolean(false);
 
-            Flux<AgentEvent> flux = next.apply(input)
+            // next.apply assembles the model Flux, and a provider formats its prompt right there
+            // (synchronously, in doStream's method body). Mark the window so the formatter can
+            // find this round; see enterModelAssembly.
+            Object[] assemblyScope = enterModelAssembly(ts, ss);
+            Flux<AgentEvent> upstream;
+            try {
+                upstream = next.apply(input);
+            } finally {
+                restoreThreadContext(assemblyScope);
+            }
+
+            Flux<AgentEvent> flux = upstream
                     .doOnNext(ev -> safely("onModelCall.event", () -> {
+                        // TTFT: time from span creation to first content event.
+                        if (!firstTokenSeen.get()
+                                && (ev instanceof TextBlockDeltaEvent
+                                    || ev instanceof ThinkingBlockDeltaEvent
+                                    || ev instanceof ToolCallStartEvent)) {
+                            if (firstTokenSeen.compareAndSet(false, true)) {
+                                long ttftMs = (System.nanoTime() - chatStartNanos) / 1_000_000L;
+                                chat.setAttribute("gen_ai.response.time_to_first_token_ms", ttftMs);
+                            }
+                        }
                         if (ev instanceof ToolCallStartEvent e) {
                             sawToolCall.set(true);
                             // Bind this tool call to the round that requested it, so onActing can
@@ -527,6 +851,14 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                                 chat.setAttribute("gen_ai.usage.output_tokens", out);
                                 chat.setAttribute("gen_ai.usage.total_tokens", total);
                                 chat.setAttribute("gen_ai.usage.cache_read.input_tokens", cacheRead);
+                                // Mean decode latency per output token; see the note in
+                                // ClsFrameworkTracer.ResponseAccumulator.flushTo.
+                                if (out > 0) {
+                                    long elapsedMs =
+                                            (System.nanoTime() - chatStartNanos) / 1_000_000L;
+                                    chat.setAttribute("gen_ai.response.time_per_output_token_ms",
+                                            (double) elapsedMs / out);
+                                }
                                 if (ts != null) {
                                     ts.sumInputTokens.addAndGet(in);
                                     ts.sumOutputTokens.addAndGet(out);
@@ -635,6 +967,10 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                 span.setAttribute("gen_ai.tool.type", "function");
                 span.setAttribute("gen_ai.tool.call.id", safe(first.getId()));
                 span.setAttribute("gen_ai.tool.call.arguments", mapToJson(first.getInput()));
+                String toolDesc = toolDescription(agent, first.getName());
+                if (notEmpty(toolDesc)) {
+                    span.setAttribute("gen_ai.tool.description", toolDesc);
+                }
             }
 
             Flux<AgentEvent> flux = next.apply(input)
@@ -676,34 +1012,55 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
     // ══════════════ span lifecycle plumbing ══════════════
 
     private Flux<AgentEvent> runChatWithSpan(Span chatSpan, Context stepContext, Flux<AgentEvent> flux) {
+        // Ended via doOnTerminate rather than doFinally so the span is closed BEFORE the terminal
+        // signal reaches the subscriber — see the note in endOnceBefore.
+        AtomicBoolean closed = new AtomicBoolean();
         return flux
                 .doOnError(err -> {
                     chatSpan.recordException(err);
                     chatSpan.setStatus(StatusCode.ERROR, safe(err.getMessage()));
                 })
-                .doFinally(sig -> {
-                    if (sig == SignalType.CANCEL) {
-                        chatSpan.setAttribute("gen_ai.incomplete", true);
-                    }
-                    chatSpan.end();
-                })
-                .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, stepContext));
+                .doOnTerminate(() -> endOnceBefore(closed, chatSpan, false))
+                .doOnCancel(() -> endOnceBefore(closed, chatSpan, true))
+                .contextWrite(reactorCtx -> storeOtelContext(
+                        reactorCtx.put(MODEL_CALL_MARK_KEY, Boolean.TRUE), stepContext));
     }
 
     private Flux<AgentEvent> runToolWithSpan(Span span, Context parent, Flux<AgentEvent> flux) {
         Context spanContext = parent.with(span);
+        AtomicBoolean closed = new AtomicBoolean();
         return flux
                 .doOnError(err -> {
                     span.recordException(err);
                     span.setStatus(StatusCode.ERROR, safe(err.getMessage()));
                 })
-                .doFinally(sig -> {
-                    if (sig == SignalType.CANCEL) {
-                        span.setAttribute("gen_ai.incomplete", true);
-                    }
-                    span.end();
-                })
+                .doOnTerminate(() -> endOnceBefore(closed, span, false))
+                .doOnCancel(() -> endOnceBefore(closed, span, true))
                 .contextWrite(reactorCtx -> storeOtelContext(reactorCtx, spanContext));
+    }
+
+    /**
+     * End a span exactly once, marking it incomplete when the sequence was cancelled.
+     *
+     * <p><b>Why not {@code doFinally}.</b> Reactor invokes a {@code doFinally} callback
+     * <em>after</em> propagating {@code onComplete}/{@code onError} downstream. A blocking caller
+     * ({@code agent.call(...).block()}, or the imperative {@code Mono.block()} that memory
+     * compression uses) is therefore released while the callback is still pending on the emitting
+     * thread. An application that flushes and shuts the exporter down immediately after that call
+     * loses those spans — they get ended after the provider is closed, so they are never exported.
+     * {@code doOnTerminate} runs before the terminal signal is propagated, which removes the race;
+     * {@code doOnCancel} covers the one case it does not see.
+     */
+    private static void endOnceBefore(AtomicBoolean closed, Span span, boolean cancelled) {
+        safely("span.end", () -> {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            if (cancelled) {
+                span.setAttribute("gen_ai.incomplete", true);
+            }
+            span.end();
+        });
     }
 
     // ══════════════ Reactor Context accessors ══════════════
@@ -714,6 +1071,400 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
 
     private static StepState stepState(reactor.util.context.ContextView cv) {
         return cv.hasKey(STEP_STATE_KEY) ? cv.get(STEP_STATE_KEY) : null;
+    }
+
+    /**
+     * Immutable snapshot of a turn, able to cross a thread hop without pinning any span.
+     *
+     * <p><b>Why values and not the live state.</b> A {@link TurnState} reference would keep the
+     * turn's {@code Span} objects — and their attributes, which include whole prompts — reachable
+     * for as long as the snapshot lives. That is unbounded if a host schedules a long-delayed task
+     * during a turn. Storing only our ids plus an OTel {@link SpanContext} (a value type: trace
+     * id, span id, flags, trace state) is enough to re-establish parentage via
+     * {@link Span#wrap(SpanContext)}, which yields a non-recording span carrying just that value.
+     *
+     * <p><b>Why not "ids only, look the turn back up".</b> Our {@code session.id} / {@code turn.id}
+     * are business identifiers, not trace identifiers — nothing in them can reconstruct the parent
+     * span. Recovering it would mean re-reading {@link #LAST_TURN_BY_SESSION} on the worker thread,
+     * which (a) still reaches the spans, only later, (b) is bounded by that index's TTL and size,
+     * and (c) is outright wrong when the same session has already started its next turn: the index
+     * holds one entry per session, so the lookup would return turn N+1 and the span would be filed
+     * under the wrong turn. The snapshot is taken while the correct turn is still in hand.
+     *
+     * <p>{@link #frameworkStepCounter} is the one exception to "values only", and deliberately so:
+     * it is the owning turn's {@code :f{N}} sequence, shared by reference. An {@link AtomicInteger}
+     * is a standalone object — holding it does NOT keep the {@link TurnState} that declares it
+     * reachable, so no span is retained. Sharing the counter (rather than claiming a number when
+     * the snapshot is taken) matters because the Scheduler hook snapshots <em>every</em> task
+     * submitted during a turn, while only the few that actually reach a model call ever synthesise
+     * a step. Claiming eagerly burned a number per submitted task and left gaps — the first
+     * memory flush of a turn came out as {@code :f3}. Claiming on use keeps the sequence dense.
+     */
+    static final class TurnSnapshot {
+        final String sessionId;
+        final String turnId;
+        /** Step id when a ReAct round was in flight at capture time, else empty. */
+        final String stepId;
+        /** Parent for spans created on the far side of the hop; never holds a recording span. */
+        final SpanContext parent;
+        /** The owning turn's framework-step sequence, drawn from only when a step is synthesised. */
+        final AtomicInteger frameworkStepCounter;
+
+        private TurnSnapshot(String sessionId, String turnId, String stepId,
+                             SpanContext parent, AtomicInteger frameworkStepCounter) {
+            this.sessionId = sessionId;
+            this.turnId = turnId;
+            this.stepId = stepId;
+            this.parent = parent;
+            this.frameworkStepCounter = frameworkStepCounter;
+        }
+
+        /** OTel context whose current span is {@link #parent}, for use as a span parent. */
+        Context asParentContext() {
+            if (parent == null || !parent.isValid()) {
+                return Context.root();
+            }
+            return withTurnIds(Context.root().with(Span.wrap(parent)), sessionId, turnId, stepId);
+        }
+
+        /** Next framework-step id for this turn, claimed at the moment a step is actually made. */
+        String nextFrameworkStepId() {
+            int seq = (frameworkStepCounter != null) ? frameworkStepCounter.incrementAndGet() : 1;
+            return turnId + ":f" + seq;
+        }
+
+        boolean hasTurn() {
+            return notEmpty(turnId);
+        }
+    }
+
+    /**
+     * Snapshot the turn held on this thread so it can travel across a Scheduler hop.
+     *
+     * <p>Needed because a component may hand work to a Scheduler <em>without</em> keeping it on the
+     * reactive chain — {@code Mono.defer(..).subscribeOn(..).subscribe(cb, cb)} is a fresh,
+     * detached subscription whose Reactor Context is empty, so neither the context nor our
+     * ThreadLocals reach the worker thread on their own. The snapshot is taken on the thread that
+     * <em>submits</em> the task, where the turn is still in scope.
+     *
+     * @return {@code null} when this thread carries no turn, so the hook can skip wrapping.
+     */
+    static TurnSnapshot captureTurnContextForHop() {
+        TurnState ts = THREAD_TURN.get();
+        // THREAD_STEP is only set to a step whose reasoning is still running (see
+        // bridgeThreadContext / StepState.reasoningDone). That matters here: a post-turn task is
+        // submitted from doOnComplete, after the last round, when TurnState.currentStep still
+        // points at that round. Treating it as live would file the framework's memory call as
+        // part of the final ReAct round instead of giving it its own framework step.
+        StepState ss = THREAD_STEP.get();
+        String session = THREAD_LAST_SESSION.get();
+
+        if (ts == null) {
+            // No turn, but the thread may still name the session it last served; that alone lets
+            // a later call be attributed when exactly one session is tracked.
+            return notEmpty(session)
+                    ? new TurnSnapshot(session, "", "", null, null)
+                    : null;
+        }
+
+        if (ss != null) {
+            // A ReAct round is genuinely in flight: hang the far-side span off that step.
+            return new TurnSnapshot(ts.sessionId, ts.turnId, ss.stepId,
+                    ss.stepSpan.getSpanContext(), ts.frameworkStepCounter);
+        }
+        // Between rounds: the far side will synthesise a step under the agent span, drawing its
+        // sequence number from the turn's counter only if it actually gets that far.
+        return new TurnSnapshot(ts.sessionId, ts.turnId, "",
+                ts.agentSpan.getSpanContext(), ts.frameworkStepCounter);
+    }
+
+    /** Snapshot published for the duration of a task that hopped onto this thread. */
+    private static final ThreadLocal<TurnSnapshot> THREAD_SNAPSHOT = new ThreadLocal<>();
+
+    /** Install a snapshot from {@link #captureTurnContextForHop} onto the current thread. */
+    static Object[] installTurnContext(TurnSnapshot snapshot) {
+        Object[] previous = new Object[]{THREAD_SNAPSHOT.get(), THREAD_LAST_SESSION.get()};
+        THREAD_SNAPSHOT.set(snapshot);
+        if (notEmpty(snapshot.sessionId)) {
+            THREAD_LAST_SESSION.set(snapshot.sessionId);
+        }
+        return previous;
+    }
+
+    /** Undo {@link #installTurnContext}, leaving the worker thread exactly as it was found. */
+    static void uninstallTurnContext(Object[] previous) {
+        TurnSnapshot prevSnapshot = (TurnSnapshot) previous[0];
+        if (prevSnapshot != null) {
+            THREAD_SNAPSHOT.set(prevSnapshot);
+        } else {
+            THREAD_SNAPSHOT.remove();
+        }
+        String session = (String) previous[1];
+        if (notEmpty(session)) {
+            THREAD_LAST_SESSION.set(session);
+        } else {
+            THREAD_LAST_SESSION.remove();
+        }
+    }
+
+    /**
+     * Snapshot + restore helper for the ThreadLocal bridge. Called by
+     * {@link ClsFrameworkTracer#runWithContext} around every Reactor signal.
+     *
+     * @return previous state to pass to {@link #restoreThreadContext}
+     */
+    static Object[] bridgeThreadContext(reactor.util.context.ContextView cv) {
+        TurnState prevTs = THREAD_TURN.get();
+        StepState prevSs = THREAD_STEP.get();
+        TurnState ts = turnState(cv);
+        StepState ss = stepState(cv);
+        if (ss == null && ts != null) {
+            // Only adopt the turn's current step while its reasoning is still running — see
+            // StepState.reasoningDone. After the last round the step stays open to host its tool
+            // span, and must not become the parent of post-turn work.
+            ss = liveStep(ts);
+        }
+        THREAD_TURN.set(ts);
+        THREAD_STEP.set(ss);
+        return new Object[]{prevTs, prevSs};
+    }
+
+    /** The turn's current round, but only while that round's reasoning is still in flight. */
+    private static StepState liveStep(TurnState ts) {
+        if (ts == null) {
+            return null;
+        }
+        StepState ss = ts.currentStep.get();
+        return (ss != null && ss.isLive()) ? ss : null;
+    }
+
+    /**
+     * Mark the window in which a model call's {@code Flux} is being assembled, so synchronous work
+     * performed during assembly can still find the owning round.
+     *
+     * <p>Needed because the {@link ClsFrameworkTracer#runWithContext} bridge covers only signal
+     * delivery, while a formatter runs during assembly — see {@link #currentFormatStep}. The
+     * window is narrow and strictly nested (it ends before {@code onModelCall} returns), and the
+     * previous values are restored, so pooled threads never leak state.
+     *
+     * @return previous state to pass to {@link #restoreThreadContext}
+     */
+    static Object[] enterModelAssembly(TurnState ts, StepState ss) {
+        TurnState prevTs = THREAD_TURN.get();
+        StepState prevSs = THREAD_STEP.get();
+        THREAD_TURN.set(ts);
+        THREAD_STEP.set(ss);
+        return new Object[]{prevTs, prevSs};
+    }
+
+    /**
+     * Resolve the step a <em>formatter</em> call belongs to.
+     *
+     * <p><b>Why this needs its own channel.</b> {@code Tracer.callFormat} is handed no
+     * {@code ContextView}, so the Reactor Context is unreachable. The ThreadLocal bridge in
+     * {@link ClsFrameworkTracer#runWithContext} is not enough either, and this is the part that is
+     * easy to get wrong: that bridge is driven by {@code Hooks.onEachOperator} and so is only
+     * populated while a Reactor <em>signal</em> is being delivered. A formatter runs earlier than
+     * that — {@code OpenAIChatModel.doStream0} calls {@code formatter.format(...)} in its own
+     * method body, i.e. while the model {@code Flux} is being <em>assembled</em>, before anything
+     * subscribes. {@link #enterModelAssembly} therefore marks that assembly window explicitly;
+     * without it this method returns {@code null} on every real call and no {@code format} span is
+     * ever produced (pinned by {@code ClsFormatSpanTest}).
+     *
+     * <p>It must <b>not</b> fall back to the per-session index or synthesise a step the way a model
+     * call does. A formatter runs on <em>every</em> model call, so guessing wrong would not produce
+     * one stray span but a steady stream of them; and a {@code format} span detached from its turn
+     * carries no diagnostic value anyway — it only means anything next to the {@code chat} span it
+     * prepared. When the owning round cannot be identified the caller records nothing at all.
+     *
+     * @return the live round's state, or {@code null} when it cannot be identified
+     */
+    static FormatSite currentFormatStep() {
+        TurnState ts = THREAD_TURN.get();
+        StepState ss = THREAD_STEP.get();
+        if (ss == null || !ss.isLive()) {
+            ss = liveStep(ts);
+        }
+        if (ss == null || ts == null) {
+            return null;
+        }
+        return new FormatSite(ss.stepCtx, ts.sessionId, ts.turnId, ss.stepId, ss.round);
+    }
+
+    /** Where a {@code format} span attaches, plus the identity it carries. */
+    static final class FormatSite {        final Context parent;
+        final String sessionId;
+        final String turnId;
+        final String stepId;
+        final long round;
+
+        FormatSite(Context parent, String sessionId, String turnId, String stepId, int round) {
+            this.parent = parent;
+            this.sessionId = sessionId;
+            this.turnId = turnId;
+            this.stepId = stepId;
+            this.round = round;
+        }
+    }
+
+    /** Restore the previous ThreadLocal state after signal processing. */
+    static void restoreThreadContext(Object[] prev) {
+        THREAD_TURN.set((TurnState) prev[0]);
+        THREAD_STEP.set((StepState) prev[1]);
+    }
+
+    /** Package-private alias for {@link #getOtelContext} usable from {@link ClsFrameworkTracer}. */
+    static Context getOtelContextFromView(reactor.util.context.ContextView cv) {
+        return getOtelContext(cv);
+    }
+
+    /** True when {@link #onModelCall} already owns the model call visible on this context. */
+    static boolean isModelCallInstrumented(reactor.util.context.ContextView cv) {
+        return cv.hasKey(MODEL_CALL_MARK_KEY);
+    }
+
+    /**
+     * Where a model call observed OUTSIDE the middleware chain should attach, plus the identity
+     * it should carry. Produced by {@link #resolveExternalCallSite}.
+     */
+    static final class ExternalCallSite {
+        /** Parent OTel context for the {@code chat} span. */
+        final Context parent;
+        final String sessionId;
+        final String turnId;
+        final String stepId;
+        /**
+         * Step span synthesised for this call, or {@code null} when an existing step was reused.
+         * The caller MUST end it once the chat span ends.
+         */
+        final Span syntheticStep;
+
+        private ExternalCallSite(Context parent, String sessionId, String turnId, String stepId,
+                                 Span syntheticStep) {
+            this.parent = parent;
+            this.sessionId = sessionId;
+            this.turnId = turnId;
+            this.stepId = stepId;
+            this.syntheticStep = syntheticStep;
+        }
+    }
+
+    /**
+     * Resolve where to hang a model call the middleware chain never saw — the framework's own
+     * memory flush / history summarisation.
+     *
+     * <p>Per the CLS GenAI spec a {@code chat} span lives under a {@code step}, so:
+     * <ul>
+     *   <li><b>A ReAct round is in flight</b> ⇒ reuse its step span.</li>
+     *   <li><b>A turn is active but no round is in flight</b> (the framework does its memory work
+     *       at a turn boundary, before the first round or after the last) ⇒ synthesise a step
+     *       span under the agent span, id {@code {turnId}:f{N}}, so the chat still nests under a
+     *       step and the tree stays spec-shaped. The caller ends it with the chat span.</li>
+     *   <li><b>No turn at all</b> (background job) ⇒ whatever the context carries, typically the
+     *       root — the call legitimately belongs to no turn and forms its own trace.</li>
+     * </ul>
+     */
+    static ExternalCallSite resolveExternalCallSite(
+            reactor.util.context.ContextView cv, Tracer tracer) {
+        TurnState ts = turnState(cv);
+        StepState ss = stepState(cv);
+        if (ss == null && ts != null) {
+            ss = liveStep(ts);
+        }
+
+        // ThreadLocal fallback: a component making a synchronous model call from inside signal
+        // processing (Mono.block()) starts a fresh subscription with no Reactor Context. The
+        // tracing hook's runWithContext bridges turn state to ThreadLocals before every signal,
+        // so such code can still find the owning turn.
+        if (ts == null) {
+            ts = THREAD_TURN.get();
+            if (ts != null && ss == null) {
+                ss = liveStep(ts);
+            }
+        }
+
+        if (ss != null) {
+            return new ExternalCallSite(ss.stepCtx,
+                    ts != null ? ts.sessionId : "", ts != null ? ts.turnId : "", ss.stepId, null);
+        }
+        if (ts == null) {
+            // No live turn on any propagation channel. Three fallbacks remain, in order.
+
+            // (a) Scheduler-hop snapshot — the turn as it was on the thread that SUBMITTED this
+            // task. Carries ids plus the parent SpanContext as values, so it is both exact and
+            // free of any reference to the turn's spans. This is the channel that covers a
+            // detached post-turn subscription (agentscope-harness's memory flush).
+            TurnSnapshot snapshot = THREAD_SNAPSHOT.get();
+            if (snapshot != null && snapshot.hasTurn()) {
+                return fromSnapshot(snapshot, tracer);
+            }
+
+            // (b) OTel Context — survives arbitrary thread hops when the host propagated it
+            // (explicitly, via a context-propagating executor, or via a java agent).
+            Context otel = getOtelContext(cv);
+            String[] ids = otel.get(OTEL_TURN_IDS_KEY);
+            if (ids != null) {
+                return new ExternalCallSite(otel, ids[0], ids[1], ids[2], null);
+            }
+
+            // (c) Session index — the framework's memory extraction runs AFTER the agent replied
+            // (it summarises the finished conversation), by which point Reactor Context,
+            // ThreadLocal turn state and OTel Context are all gone. Recover the turn via the
+            // session: first the session this thread last served, else the only session in
+            // flight. Attaching to an ENDED agent span is legal in OTel — parentage is a span-id
+            // reference — so the memory span still renders nested, which is what a memory call
+            // conceptually is.
+            ts = recentTurnForSession(THREAD_LAST_SESSION.get());
+            if (ts == null) {
+                ts = soleTrackedTurn();
+            }
+            if (ts == null) {
+                return new ExternalCallSite(otel, "", "", "", null);
+            }
+        }
+
+        return synthesiseFrameworkStep(tracer, ts.agentCtx, ts.sessionId, ts.turnId,
+                ts.turnId + ":f" + ts.frameworkStepCounter.incrementAndGet());
+    }
+
+    /**
+     * Build the call site from a {@link TurnSnapshot} that crossed a Scheduler hop.
+     *
+     * <p>When a ReAct round was in flight at capture time the snapshot's parent IS that step, so
+     * the chat span attaches straight to it. Otherwise a {@code framework_step} is synthesised
+     * under the agent span, using the sequence number claimed at capture time.
+     */
+    private static ExternalCallSite fromSnapshot(TurnSnapshot snapshot, Tracer tracer) {
+        Context parent = snapshot.asParentContext();
+        if (notEmpty(snapshot.stepId)) {
+            return new ExternalCallSite(parent, snapshot.sessionId, snapshot.turnId,
+                    snapshot.stepId, null);
+        }
+        return synthesiseFrameworkStep(tracer, parent, snapshot.sessionId, snapshot.turnId,
+                snapshot.nextFrameworkStepId());
+    }
+
+    /**
+     * Create the {@code step} span that holds a model call the middleware chain never saw, so the
+     * tree keeps the spec shape ({@code chat} always under a {@code step}) without disturbing
+     * {@code gen_ai.react.round} or the {@code :s{N}} ids of real rounds.
+     */
+    private static ExternalCallSite synthesiseFrameworkStep(
+            Tracer tracer, Context parent, String sessionId, String turnId, String stepId) {
+        Span step = tracer.spanBuilder("framework_step")
+                .setParent(parent)
+                .setSpanKind(SpanKind.INTERNAL)
+                .startSpan();
+        step.setAttribute("gen_ai.span.kind", "step");
+        step.setAttribute("gen_ai.operation.name", "step");
+        step.setAttribute("gen_ai.session.id", sessionId);
+        step.setAttribute("gen_ai.turn.id", turnId);
+        step.setAttribute("gen_ai.step.id", stepId);
+        // Distinguishes this from a ReAct round: it wraps framework-internal work (memory flush /
+        // history summarisation) that the agent's middleware chain never routes through.
+        step.setAttribute("gen_ai.step.type", "framework");
+        debugSpan("step(framework)", step, parent);
+        return new ExternalCallSite(parent.with(step), sessionId, turnId, stepId, step);
     }
 
     /**
@@ -738,7 +1489,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
      * 将 OTel Context 同时存入自定义 key 和 {@link ContextPropagationOperator}。
      * 双写确保无论下游通过哪种方式读取都能拿到正确的 parent context。
      */
-    private static reactor.util.context.Context storeOtelContext(
+    static reactor.util.context.Context storeOtelContext(
             reactor.util.context.Context reactorCtx, Context otelCtx) {
         reactor.util.context.Context updated = reactorCtx.put(OTEL_CONTEXT_KEY, otelCtx);
         try {
@@ -771,7 +1522,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
     }
 
     /** Run a telemetry side effect, swallowing any error so it can never break the event stream. */
-    private static void safely(String where, Runnable action) {
+    static void safely(String where, Runnable action) {
         try {
             action.run();
         } catch (Throwable t) {
@@ -779,11 +1530,26 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
         }
     }
 
+    /**
+     * {@link #safely(String, Runnable)} for a value-returning read, used when the value comes from
+     * host code that may throw — e.g. a {@code default} interface method an implementation
+     * overrode badly. Telemetry must never propagate such a failure into the agent's own flow.
+     */
+    static <T> T safely(String where, java.util.function.Supplier<T> read, T fallback) {
+        try {
+            T value = read.get();
+            return (value != null) ? value : fallback;
+        } catch (Throwable t) {
+            telemetryFailed(where, t);
+            return fallback;
+        }
+    }
+
     private static final AtomicLong LAST_TELEMETRY_WARN_MINUTE = new AtomicLong(-1);
     private static final AtomicLong TELEMETRY_DROPPED = new AtomicLong();
 
     /** Rate-limited (once/minute) warning so a persistent telemetry fault cannot flood logs. */
-    private static void telemetryFailed(String where, Throwable t) {
+    static void telemetryFailed(String where, Throwable t) {
         long dropped = TELEMETRY_DROPPED.incrementAndGet();
         long minute = System.currentTimeMillis() / 60_000L;
         long last = LAST_TELEMETRY_WARN_MINUTE.get();
@@ -797,7 +1563,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
     private static final boolean TRACE_DEBUG =
             System.getenv("CLS_TRACE_DEBUG") != null && !System.getenv("CLS_TRACE_DEBUG").isEmpty();
 
-    private static void debugSpan(String label, Span span, Context parent) {
+    static void debugSpan(String label, Span span, Context parent) {
         if (!TRACE_DEBUG) {
             return;
         }
@@ -810,11 +1576,11 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
                 + " parentSpanId=" + parentSpanId);
     }
 
-    private static boolean notEmpty(String s) {
+    static boolean notEmpty(String s) {
         return s != null && !s.isEmpty();
     }
 
-    private static String safe(String s) {
+    static String safe(String s) {
         return s == null ? "" : s;
     }
 
@@ -851,7 +1617,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
     }
 
     /** Serialise a list of {@link Msg} into the spec's {@code [{role, parts:[{type,content}]}]} JSON. */
-    private static String msgListToJson(List<Msg> msgs) {
+    static String msgListToJson(List<Msg> msgs) {
         if (msgs == null || msgs.isEmpty()) {
             return "[]";
         }
@@ -862,6 +1628,175 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
             }
         }
         return writeJson(arr, "[]");
+    }
+
+    /**
+     * The spec's {@code gen_ai.system_instructions}: the system prompt lifted out of the message
+     * list into its own attribute, so it can be read without parsing {@code gen_ai.input.messages}.
+     * Returns {@code ""} when the call carries none, in which case the caller omits the attribute.
+     *
+     * <p>{@code gen_ai.input.messages} deliberately still contains these messages — it is the
+     * verbatim record of what was sent, and trimming it would silently change an attribute that
+     * existing dashboards and tests already read.
+     */
+    static String systemInstructionsToJson(List<Msg> msgs) {
+        if (msgs == null || msgs.isEmpty()) {
+            return "";
+        }
+        List<Object> arr = new ArrayList<>();
+        for (Msg m : msgs) {
+            if (m != null && m.getRole() == MsgRole.SYSTEM) {
+                arr.add(msgToMap(m));
+            }
+        }
+        return arr.isEmpty() ? "" : writeJson(arr, "");
+    }
+
+    /**
+     * The spec's {@code gen_ai.tool.definitions}: the tool schemas offered to the model on this
+     * call. Without it a trace only records which tools were <em>invoked</em>, so a model that
+     * failed to call an expected tool is indistinguishable from one that was never offered it.
+     */
+    static String toolDefinitionsToJson(List<ToolSchema> tools) {
+        if (tools == null || tools.isEmpty()) {
+            return "";
+        }
+        List<Object> arr = new ArrayList<>(tools.size());
+        for (ToolSchema t : tools) {
+            if (t == null) {
+                continue;
+            }
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("type", "function");
+            m.put("name", safe(t.getName()));
+            if (notEmpty(t.getDescription())) {
+                m.put("description", t.getDescription());
+            }
+            if (t.getParameters() != null && !t.getParameters().isEmpty()) {
+                m.put("parameters", t.getParameters());
+            }
+            arr.add(m);
+        }
+        return arr.isEmpty() ? "" : writeJson(arr, "");
+    }
+
+    /**
+     * Copy the sampling parameters of a model call onto its {@code chat} span. These are what makes
+     * a recorded call reproducible: the same prompt at a different temperature is a different
+     * experiment.
+     *
+     * <p><b>This is strictly a whitelist, and must stay one.</b> {@link GenerateOptions} also
+     * exposes {@code getApiKey()} and {@code getBaseUrl()}; serialising the object wholesale — or
+     * adding a convenient "copy everything" loop later — would write the caller's API key into
+     * CLS. Only the fields enumerated below are ever read.
+     *
+     * <p><b>What these values are, precisely.</b> They are the options the <em>caller</em> passed
+     * for this call — for a {@code ReActAgent} that is its {@code generateOptions}. A model
+     * instance may additionally carry its own defaults (e.g. {@code OpenAIChatModel} keeps a
+     * private {@code configuredOptions} built from its builder) which it merges in inside
+     * {@code doStream}, below every observable boundary and with no accessor. So an attribute that
+     * is absent here means "the caller did not specify it", <em>not</em> "the provider used its
+     * own default"; and a value present here can still be overridden deeper down. Reading the
+     * effective value would require reflecting into provider internals, which is not worth the
+     * fragility.
+     */
+    static void applyRequestOptions(Span span, GenerateOptions o) {
+        if (span == null || o == null) {
+            return;
+        }
+        if (o.getTemperature() != null) {
+            span.setAttribute("gen_ai.request.temperature", o.getTemperature());
+        }
+        if (o.getTopP() != null) {
+            span.setAttribute("gen_ai.request.top_p", o.getTopP());
+        }
+        if (o.getTopK() != null) {
+            span.setAttribute("gen_ai.request.top_k", o.getTopK().longValue());
+        }
+        // Newer models carry the budget in maxCompletionTokens instead; report whichever is set so
+        // the attribute is not silently empty on them.
+        Integer maxTokens = (o.getMaxTokens() != null)
+                ? o.getMaxTokens() : o.getMaxCompletionTokens();
+        if (maxTokens != null) {
+            span.setAttribute("gen_ai.request.max_tokens", maxTokens.longValue());
+        }
+        if (o.getSeed() != null) {
+            span.setAttribute("gen_ai.request.seed", o.getSeed());
+        }
+        if (o.getFrequencyPenalty() != null) {
+            span.setAttribute("gen_ai.request.frequency_penalty", o.getFrequencyPenalty());
+        }
+        if (o.getPresencePenalty() != null) {
+            span.setAttribute("gen_ai.request.presence_penalty", o.getPresencePenalty());
+        }
+    }
+
+    /**
+     * The GenAI provider behind a model instance, normalised to the spec's
+     * {@code gen_ai.provider.name} values.
+     *
+     * <p>Derived from the implementing class, because AgentScope's {@code Model} exposes only a
+     * model <em>name</em> ({@code hy4-preview}, {@code qwen-plus}) — which says nothing about who
+     * served it. Without this, cost and latency cannot be grouped by vendor, and an
+     * OpenAI-compatible endpoint is indistinguishable from OpenAI itself.
+     *
+     * <p>Returns {@code ""} for anything unrecognised rather than guessing: an attribute that is
+     * absent is honest, whereas one that is wrong silently corrupts per-provider aggregates. The
+     * values match the reference java-agent's mapping so traces from both are comparable.
+     */
+    static String providerName(Object model) {
+        return (model == null) ? "" : providerNameOf(model.getClass().getName());
+    }
+
+    /**
+     * The class-name → provider mapping, split out so it can be tested against the real
+     * fully-qualified names ({@code io.agentscope.extensions.model.openai.OpenAIChatModel}) without
+     * needing each provider on the test classpath.
+     */
+    static String providerNameOf(String cls) {
+        if (cls == null) {
+            return "";
+        }
+        if (cls.contains(".dashscope.") || cls.endsWith(".DashScopeChatModel")) {
+            return "dashscope";
+        }
+        if (cls.contains(".gemini.") || cls.endsWith(".GeminiChatModel")) {
+            return "gcp.gemini";
+        }
+        if (cls.contains(".anthropic.") || cls.endsWith(".AnthropicChatModel")) {
+            return "anthropic";
+        }
+        if (cls.contains(".openai.") || cls.endsWith(".OpenAIChatModel")) {
+            return "openai";
+        }
+        if (cls.contains(".ollama.") || cls.endsWith(".OllamaChatModel")) {
+            return "ollama";
+        }
+        return "";
+    }
+
+    /**
+     * Set the request-side attributes shared by both model-call paths: the middleware's
+     * {@code onModelCall} and {@link ClsFrameworkTracer}'s framework-level hook. Keeping it in one
+     * place is what stops the two paths from drifting apart in what they record.
+     */
+    static void applyModelRequest(
+            Span span, List<Msg> messages, List<ToolSchema> tools, GenerateOptions options) {
+        if (messages != null) {
+            span.setAttribute("gen_ai.input.messages", msgListToJson(messages));
+            String sys = systemInstructionsToJson(messages);
+            if (notEmpty(sys)) {
+                span.setAttribute("gen_ai.system_instructions", sys);
+            }
+        }
+        if (tools != null && !tools.isEmpty()) {
+            span.setAttribute("gen_ai.request.tool_count", (long) tools.size());
+            String defs = toolDefinitionsToJson(tools);
+            if (notEmpty(defs)) {
+                span.setAttribute("gen_ai.tool.definitions", defs);
+            }
+        }
+        applyRequestOptions(span, options);
     }
 
     private static Map<String, Object> msgToMap(Msg m) {
@@ -940,7 +1875,7 @@ public final class ClsTracingMiddleware implements MiddlewareBase {
         return assistantPartsToJson("", text);
     }
 
-    private static String assistantPartsToJson(String thought, String text) {
+    static String assistantPartsToJson(String thought, String text) {
         List<Object> parts = new ArrayList<>();
         if (notEmpty(thought)) {
             Map<String, Object> p = new LinkedHashMap<>();

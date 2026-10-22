@@ -49,6 +49,102 @@ Reactor Context, so a single instance is safe across concurrent turns and HITL s
 | `onActing` | onion | ✅ | `tool` (CLIENT, `execute_tool`) — nested under the current step |
 | `onSystemPrompt` | transformer | ➖ | none — prompt-rewriting hook, passed through untouched |
 
+### Framework-internal model calls (memory compression / summarisation)
+
+The middleware chain only sees model calls routed through `onModelCall`. The SDK additionally
+hooks AgentScope's `TracerRegistry` — the lowest-level entry behind `ChatModelBase.stream()` — to
+cover components that **bypass the chain** and call `Model.stream()` directly.
+
+#### Measured against the published bytecode
+
+| Source | Path | Captured by the middleware alone |
+|---|---|:---:|
+| `ReActAgent` normal turn | `onModelCall → Model.stream()` | ✅ |
+| `ReActAgent` out-of-iterations summary (`summarizing()`) | `MiddlewareChain → onModelCall` | ✅ |
+| **`agentscope-harness` memory flush** | **`MemoryFlushManager` → direct `Model.stream()`, scheduled from `onAgent`'s `doOnComplete`** | **❌** |
+| **`AutoContextMemory` compression** (1.x extension) | **`callModelForSummary` → direct `Model.stream()`; 4 call sites, 0 `MiddlewareChain` refs** | **❌** |
+
+The one that shows up in practice is `agentscope-harness`: `MemoryFlushMiddleware` implements only
+`onAgent`, and after the turn completes it hands `MemoryFlushManager.flushMemories(...)` to a
+Scheduler. That call uses harness's own `DEFAULT_FLUSH_PROMPT` ("You are a memory extraction
+assistant…") and never passes through `onModelCall`, so the middleware alone produces no span for
+it. This is the extra `chat` span an agent-based probe shows under `invoke_agent`.
+
+`AutoContextMemory` (from `io.agentscope:agentscope-extensions-autocontext-memory`) has the same
+shape — a synchronous `callModelForSummary` ending in `Mono.block()`. Note it is published only for
+AgentScope **1.x**: it implements `io.agentscope.core.state.StateModule` and references
+`core.session.Session`, neither of which exists in core 2.0.x, so it cannot load there. It is
+listed because the capture mechanism covers it, not because 2.x users will hit it.
+
+Because `ChatModelBase.stream()` is `final` and its first instruction is `TracerRegistry.get()`,
+hooking there sees **every** model call regardless of which layer above decided to make it.
+
+#### Turn correlation
+
+The hard part is not capturing these calls, it is knowing which turn they belong to. The framework
+runs memory work **after the agent has replied**, from a callback, often on another thread — so the
+Reactor Context is empty by then. The owning turn is resolved through five channels, tried in order:
+
+| Channel | Covers |
+|---|---|
+| Reactor Context | the call sits inside the agent's reactive chain (incl. `subscribeOn`/`publishOn`) |
+| ThreadLocal, bridged on every Reactor signal | an imperative `Mono.block()` fired from a callback |
+| **Scheduler-hop snapshot** | a **detached** subscription handed to a Scheduler — `Mono.defer(..).subscribeOn(..).subscribe(cb, cb)`, which is what `agentscope-harness`'s `MemoryFlushMiddleware` does |
+| OTel `Context` | a thread hop the host propagated explicitly, or via a context-propagating executor / java agent |
+| Per-session index of the most recent turn | a post-turn call with no other hint, when a single session is tracked |
+
+The third channel is the one that matters on a real multi-user service. `MemoryFlushMiddleware`
+overrides only `onAgent`, schedules the flush from `Flux.doOnComplete(...)`, and writes nothing to
+the context (verified: zero `contextWrite` calls in it or `MemoryFlushManager`) — so by the time the
+model is called, Reactor Context, ThreadLocals and OTel Context are all gone. The SDK therefore
+registers a `Schedulers.onScheduleHook` that snapshots the turn on the thread **submitting** the
+task — where it is still in scope — and restores it around the task on the worker thread. This is
+the same mechanism OpenTelemetry's own `reactor-3.1` instrumentation uses.
+
+The snapshot holds **values only** — our ids, a `SpanContext`, and the turn's step counter — never
+the turn's spans, so a long-delayed task cannot pin whole prompts in memory. It is also why the
+span is filed under the turn that *submitted* it rather than whichever turn happens to be current
+when it runs: a user's second message can start turn 2 while turn 1's flush is still pending.
+
+- Every such span carries `gen_ai.model.call.origin=framework`, making them easy to isolate in CLS.
+- `ClsTracingMiddleware.currentTurnOtelContext()` exposes the turn's OTel `Context` if you dispatch
+  memory work onto your own executor and want to propagate it explicitly.
+- Pinned by `ClsHarnessMemoryFlushTest`, `ClsDetachedSchedulerCorrelationTest` and
+  `ClsTurnSnapshotTest`.
+
+**Remaining limitation** — when the **submitting** thread carries no turn either (a bare
+`ExecutorService`, a timer thread) and several sessions are tracked, attribution is deliberately
+declined: cross-attributing one tenant's memory call to another tenant's trace would corrupt the
+data. The span is still recorded, just on its own trace with no `gen_ai.session.id`. Propagating
+`currentTurnOtelContext()` removes the ambiguity.
+
+#### Where the span attaches
+
+Per the CLS GenAI spec a `chat` span lives under a `step`:
+
+| When the call happens | Where the span attaches |
+|---|---|
+| During a ReAct round | reuses that round's `step` |
+| During a turn but outside any round | a `step` is synthesised (`gen_ai.step.type=framework`, id `{turnId}:f{N}`) |
+| After the turn finished (the usual memory-flush case) | a synthesised `step` under that turn's `agent` span |
+| Attribution ambiguous or no turn at all (background job) | forms its own independent trace |
+
+- **No double counting** — the middleware publishes a marker on the Reactor Context around its own
+  `chat` span; because a Reactor Context propagates downstream-to-upstream, the low-level entry
+  recognises an already-instrumented call and stays silent.
+- **Round numbering untouched** — synthesised steps use a separate counter (`:f{N}`), so
+  `gen_ai.react.round` and the `:s{N}` ids are unaffected. A round's `step` span is deliberately
+  kept open past its own reasoning Flux (to host that round's tool span), so the SDK tracks whether
+  reasoning has finished — otherwise post-turn memory work would be filed inside the last round.
+- **No probe displaced** — a previously registered tracer is kept as a delegate and keeps receiving
+  every callback.
+- **Switchable** — `CLS_CAPTURE_FRAMEWORK_CALLS=false` turns the capture off entirely;
+  `CLS_PROPAGATE_ACROSS_SCHEDULERS=false` keeps capturing but installs no Scheduler hook, so
+  detached calls are traced without turn correlation.
+- **Degrades safely** — if that entry point is unavailable in a future AgentScope, the SDK logs a
+  warning and falls back to middleware-only tracing.
+
+
 ### Human-in-the-loop (HITL) awareness
 
 A parked or interrupted turn is not reported as a normal completion. The middleware watches
@@ -124,6 +220,9 @@ Existing environment variables are never overridden by the `.env` file.
 | `CLS_SOURCE` | `.source(String)` | | local IP (auto-detected) | Source tag for the spans; falls back to the machine's local IP, then `127.0.0.1`. |
 | `CLS_BATCH_SIZE` | `.batchSize(Integer)` | | `32` | Max spans per export batch. Clamped to `[1, 1000]`. |
 | `CLS_DEBUG` | `.debug(Boolean)` | | `false` | Verbose logging. Truthy env values: `1` / `true` / `yes`. |
+| `CLS_CAPTURE_FRAMEWORK_CALLS` | `.captureFrameworkModelCalls(Boolean)` | | `true` | Trace model calls that bypass the middleware chain (memory flush / summarisation). Off values: `0` / `false` / `no`. |
+| `CLS_PROPAGATE_ACROSS_SCHEDULERS` | `.propagateAcrossSchedulers(Boolean)` | | `true` | Carry turn context across Reactor `Scheduler` hops, so a detached post-turn memory call is attributed to its turn. Installs a process-wide `Schedulers.onScheduleHook`; turn off to leave the shared Schedulers untouched — such calls are then still traced, just uncorrelated. Off values: `0` / `false` / `no`. |
+| `CLS_CAPTURE_FORMAT_CALLS` | `.captureFormatCalls(Boolean)` | | `false` | Add a `format` span per prompt-formatting call. **Off by default**: a formatter runs on every model call, so this roughly doubles a turn's span count while recording a re-encoding of messages already on the sibling `chat` span. Turn it on to debug provider-specific prompt assembly. On values: `1` / `true` / `yes`. |
 
 If any **required** field is missing, `build()` throws `IllegalStateException` listing
 exactly which ones are absent.

@@ -48,6 +48,91 @@ per-turn 字段；所有 turn/round 状态都存在随 Reactor Context 传递的
 | `onActing` | onion | ✅ | `tool`（CLIENT, `execute_tool`）—— 挂在当前 step 下 |
 | `onSystemPrompt` | transformer | ➖ | 无 —— 属于 prompt 改写型 hook，原样透传不改写 |
 
+### 框架内部模型调用（记忆压缩 / 摘要）
+
+中间件链只能看到流经 `onModelCall` 的模型调用。本 SDK 额外接管 AgentScope 的 `TracerRegistry`
+（`ChatModelBase.stream()` 的最底层入口），覆盖那些**绕过中间件链**直接调用 `Model.stream()` 的组件。
+
+#### 实测结论（已核对字节码）
+
+| 来源 | 路径 | 原中间件能否采集 |
+|---|---|:---:|
+| `ReActAgent` 正常问答 | `onModelCall → Model.stream()` | ✅ |
+| `ReActAgent` 轮次耗尽摘要（`summarizing()`） | `MiddlewareChain → onModelCall` | ✅ |
+| **`agentscope-harness` 记忆抽取** | **`MemoryFlushManager` 直接 `Model.stream()`，由 `onAgent` 的 `doOnComplete` 派发** | **❌** |
+| **`AutoContextMemory` 记忆压缩**（1.x 扩展） | **`callModelForSummary` 直接 `Model.stream()`，4 处调用点、0 处 `MiddlewareChain`** | **❌** |
+
+实际会遇到的是 `agentscope-harness`：`MemoryFlushMiddleware` 只实现 `onAgent`，turn 结束后把
+`MemoryFlushManager.flushMemories(...)` 丢给 Scheduler 执行。该调用使用 harness 自带的
+`DEFAULT_FLUSH_PROMPT`（"You are a memory extraction assistant…"），完全不经过 `onModelCall`，
+因此仅靠中间件采不到它 —— 这就是探针侧在 `invoke_agent` 下多出来的那条 `chat` span。
+
+`AutoContextMemory`（来自 `io.agentscope:agentscope-extensions-autocontext-memory`）形态相同：
+同步的 `callModelForSummary`，以 `Mono.block()` 结尾。注意它只发布到 AgentScope **1.x**：
+实现了 `io.agentscope.core.state.StateModule`、签名引用 `core.session.Session`，这两者在
+core 2.0.x 中都不存在，因此在 2.x 上无法加载。列出它是因为采集机制同样覆盖，而非 2.x 用户会遇到。
+
+由于 `ChatModelBase.stream()` 是 `final` 且首条指令即 `TracerRegistry.get()`，在此接管即可看到
+**所有**模型调用，无论上层由谁发起。
+
+#### turn 关联
+
+难点不在采集，而在判断这些调用属于哪个 turn。框架在 **Agent 回复完之后**、从回调里、常常在另一个
+线程上执行记忆工作 —— 此时 Reactor Context 已为空。SDK 按顺序尝试五条通道定位所属 turn：
+
+| 通道 | 覆盖场景 |
+|---|---|
+| Reactor Context | 调用位于 Agent 的响应式链内（含 `subscribeOn` / `publishOn` 跨线程） |
+| ThreadLocal（每个 Reactor 信号前桥接） | 从回调中发起的命令式 `Mono.block()` |
+| **Scheduler 跳转快照** | 派发给 Scheduler 的**游离订阅** —— `Mono.defer(..).subscribeOn(..).subscribe(cb, cb)`，即 `agentscope-harness` 的 `MemoryFlushMiddleware` 的做法 |
+| OTel `Context` | 宿主显式传播，或经由上下文透传的线程池 / java agent |
+| 按 session 索引的最近一个 turn | 无其他线索的 turn 后调用，且在途只有一个 session |
+
+第三条才是真实多用户服务的关键。`MemoryFlushMiddleware` 只重写 `onAgent`，从
+`Flux.doOnComplete(...)` 派发 flush，且不向上下文写任何东西（实测：它与 `MemoryFlushManager` 中
+`contextWrite` 出现 0 次）—— 等到真正调模型时，Reactor Context、ThreadLocal、OTel Context 全都
+失效了。因此 SDK 注册了 `Schedulers.onScheduleHook`：在**提交**任务的线程上（此时 turn 仍在作用域内）
+对 turn 做快照，并在 worker 线程上围绕任务安装/还原。这与 OpenTelemetry 官方 `reactor-3.1`
+插桩所用的机制相同。
+
+快照**只存值** —— 我们的各类 id、一个 `SpanContext`、以及该 turn 的 step 计数器 —— 不持有 turn 的
+span，因此长延迟任务不会把整段 prompt 钉在内存里。这也是为什么 span 会归属到**提交它的那个 turn**，
+而不是执行时恰好最新的 turn：用户的第二条消息可能在 turn 1 的 flush 还未执行时就开启了 turn 2。
+
+- 所有这类 span 都带 `gen_ai.model.call.origin=framework`，在 CLS 侧易于筛选。
+- 若你把记忆 / 摘要工作派发到自己的线程池，可用
+  `ClsTracingMiddleware.currentTurnOtelContext()` 取出当前 turn 的 OTel `Context` 显式传播。
+- 由 `ClsHarnessMemoryFlushTest`、`ClsDetachedSchedulerCorrelationTest`、`ClsTurnSnapshotTest` 固化。
+
+**仍存在的限制** —— 当**提交线程**也不携带任何 turn（裸 `ExecutorService`、定时器线程）且多个
+session 并发在途时，SDK 会**主动放弃归属**：把某个租户的记忆调用错挂到另一个租户的 trace 上，
+比留一条孤立 trace 更糟。此时 span 依然被采集，只是自成一条 trace 且不带 `gen_ai.session.id`。
+显式传播 `currentTurnOtelContext()` 可消除这种歧义。
+
+#### span 挂载位置
+
+按 CLS GenAI 规范 `chat` 必须位于某个 `step` 之下：
+
+| 调用时机 | 挂载位置 |
+|---|---|
+| 某个 ReAct 轮次执行中 | 复用该轮次的 `step` |
+| turn 内但不在任何轮次中 | 合成一个 `step`（`gen_ai.step.type=framework`，id 为 `{turnId}:f{N}`） |
+| turn 结束后（记忆抽取的常见情形） | 挂在该 turn 的 `agent` span 下的合成 `step` |
+| 归属存在歧义，或本就不属于任何 turn（后台任务） | 自成一条独立 trace |
+
+- **不会重复计数** —— 中间件在自己的 `chat` span 周围向 Reactor Context 写入标记；
+  由于 Reactor Context 自下游向上游传播，底层入口能识别出"已被中间件采集"并让行。
+- **不影响轮次编号** —— 合成 step 使用独立计数器（`:f{N}`），`gen_ai.react.round`
+  与 `:s{N}` 的编号不受影响。轮次的 `step` span 会被**故意保持打开**到其 reasoning Flux 之后
+  （用于承载该轮次的 tool span），因此 SDK 会额外记录 reasoning 是否已结束 —— 否则 turn 后的
+  记忆工作会被错误地归入最后一个轮次。
+- **不会顶掉已有探针** —— 原先注册的 tracer 会被保留为 delegate，所有回调继续透传。
+- **可关闭** —— `CLS_CAPTURE_FRAMEWORK_CALLS=false` 完全关闭采集；
+  `CLS_PROPAGATE_ACROSS_SCHEDULERS=false` 保留采集但不安装 Scheduler 钩子，
+  此时游离调用仍被采集，只是不做 turn 关联。
+- **降级安全** —— 该入口若在未来版本中不可用，SDK 打 warn 日志并退回"仅中间件采集"。
+
+
 ### 人工介入（HITL）感知
 
 被挂起或中断的 turn 不会被当作正常完成上报。中间件通过监听事件流与 Reactor 信号，
@@ -122,6 +207,9 @@ export CLS_DEBUG=true
 | `CLS_SOURCE` | `.source(String)` | | 本机 IP（自动探测） | span 的来源标记；探测失败时回退为本机 IP，再回退 `127.0.0.1`。 |
 | `CLS_BATCH_SIZE` | `.batchSize(Integer)` | | `32` | 单个导出批次的最大 span 数，限制在 `[1, 1000]`。 |
 | `CLS_DEBUG` | `.debug(Boolean)` | | `false` | 详细日志。环境变量真值：`1` / `true` / `yes`。 |
+| `CLS_CAPTURE_FRAMEWORK_CALLS` | `.captureFrameworkModelCalls(Boolean)` | | `true` | 是否采集绕过中间件链的框架内部模型调用（记忆 / 历史摘要）。关闭取值：`0` / `false` / `no`。 |
+| `CLS_PROPAGATE_ACROSS_SCHEDULERS` | `.propagateAcrossSchedulers(Boolean)` | | `true` | 是否跨 Reactor `Scheduler` 传递 turn 上下文，使 turn 结束后游离派发的记忆调用仍能归属到对应 turn。会安装一个进程级 `Schedulers.onScheduleHook`；关闭则不触碰共享 Scheduler，此时这类调用仍被采集、但不做关联。关闭取值：`0` / `false` / `no`。 |
+| `CLS_CAPTURE_FORMAT_CALLS` | `.captureFormatCalls(Boolean)` | | `false` | 是否为每次提示词格式化生成一个 `format` span。**默认关闭**：formatter 在每次模型调用时都会执行，开启后一个 turn 的 span 数量大约翻倍，而它记录的是兄弟 `chat` span 上已有消息的再编码。排查 provider 特定的提示词拼装问题时再打开。开启取值：`1` / `true` / `yes`。 |
 
 若任一**必填**字段缺失，`build()` 会抛 `IllegalStateException`，并明确列出缺哪些。
 

@@ -107,6 +107,23 @@ public final class ClsObservability {
 
         Tracer tracer = sdk.getTracer(INSTRUMENTATION_SCOPE);
 
+        // Model calls issued by the framework itself (memory flush / history summarisation) call
+        // Model.stream() directly and never reach the middleware chain, so ClsTracingMiddleware
+        // alone cannot see them. Hooking AgentScope's TracerRegistry captures those too. Optional:
+        // AgentScope is a `provided` dependency, so the classes may legitimately be absent.
+        boolean frameworkCallsCaptured = false;
+        if (config.captureFrameworkModelCalls()) {
+            try {
+                frameworkCallsCaptured =
+                        ClsFrameworkTracer.install(tracer, config.propagateAcrossSchedulers(),
+                                config.captureFormatCalls());
+            } catch (Throwable t) {
+                LOG.warn("Framework-level model tracing unavailable, model calls made outside the "
+                        + "agent middleware chain (memory flush / summarisation) will not be "
+                        + "traced: {}", t.toString());
+            }
+        }
+
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
                 tracerProvider.close();
@@ -116,9 +133,13 @@ public final class ClsObservability {
         }, "cls-observability-v2-shutdown"));
 
         LOG.info("CLS observability (v2, OTLP/HTTP) installed for AgentScope Java "
-                        + "(service={}, endpoint={}, topic={}). "
+                        + "(service={}, endpoint={}, topic={}, frameworkModelCalls={}, "
+                        + "schedulerPropagation={}, formatSpans={}). "
                         + "Add ClsObservability.newTracingMiddleware() to your agent.",
-                config.serviceName(), config.otlpTracesUrl(), config.topicId());
+                config.serviceName(), config.otlpTracesUrl(), config.topicId(),
+                frameworkCallsCaptured ? "captured" : "off",
+                (frameworkCallsCaptured && config.propagateAcrossSchedulers()) ? "on" : "off",
+                (frameworkCallsCaptured && config.captureFormatCalls()) ? "on" : "off");
 
         return new ClsObservability(tracerProvider, exporter, sdk, tracer);
     }

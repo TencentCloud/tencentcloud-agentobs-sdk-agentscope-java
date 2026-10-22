@@ -21,17 +21,45 @@
     </properties>
 
     <dependencies>
-        <!-- 待验证的 SDK (0.0.4, 已 shade OTel API，刚装入本地仓库) -->
+        <!-- 待验证的 SDK (0.0.5, 已 shade OTel API，刚装入本地仓库) -->
         <dependency>
             <groupId>com.tencentcloudapi.observability</groupId>
             <artifactId>tencentcloud-agentobs-sdk-agentscope-java</artifactId>
-            <version>0.0.4</version>
+            <version>0.0.5</version>
         </dependency>
 
         <!-- 客户生产环境使用的 AgentScope 版本 -->
         <dependency>
             <groupId>io.agentscope</groupId>
             <artifactId>agentscope-core</artifactId>
+            <version>2.0.1</version>
+        </dependency>
+
+        <!--
+          真实 OpenAI 兼容模型实现（OpenAIChatModel extends ChatModelBase）。
+          baseUrl 可配，因此通义 / DeepSeek / 智谱 / Moonshot 等兼容接口都能用。
+          仅当 .env 里提供了 LLM_API_KEY 时才会被 demo 使用，否则回退 MockChatModel。
+          注：该扩展最低发布版本为 2.0.2，比 core 2.0.1 略新；两者 API 兼容。
+        -->
+        <dependency>
+            <groupId>io.agentscope</groupId>
+            <artifactId>agentscope-extensions-model-openai</artifactId>
+            <version>2.0.2</version>
+        </dependency>
+
+        <!--
+          真实的 agentscope-harness，提供 MemoryFlushMiddleware —— 「记忆抽取」这一类
+          绕过中间件链的模型调用的真实来源。版本 2.0.1 与 core 2.0.1 完全对齐
+          （harness 只依赖 core + jackson-yaml + commons-compress + sqlite-jdbc）。
+          引入真包而非自己模拟，才能保证验证的是上游真实调用形态：
+              next.apply(input).concatWith(Mono.defer(..).subscribeOn(boundedElastic))
+          注：另一个候选 agentscope-extensions-autocontext-memory 只发布到 1.1.0-RC2，
+          面向 core 1.x 构建（implements core.state.StateModule、引用 core.session.Session，
+          二者在 core 2.0.x 中均不存在），在本工程无法加载。
+        -->
+        <dependency>
+            <groupId>io.agentscope</groupId>
+            <artifactId>agentscope-harness</artifactId>
             <version>2.0.1</version>
         </dependency>
 
