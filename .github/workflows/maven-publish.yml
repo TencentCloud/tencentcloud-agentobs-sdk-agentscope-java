@@ -22,6 +22,26 @@ jobs:
         gpg-private-key: ${{ secrets.OSSRH_GPG_SECRET_KEY }}
         gpg-passphrase: MAVEN_GPG_PASSPHRASE
 
+    # The release version comes from the pom, never from a hand-written literal:
+    # the bundle name used to be hardcoded, so every release after 0.0.2 would have
+    # been uploaded under that name. When triggered by a tag, the tag must agree
+    # with the pom, otherwise the tag would point at a different version than the
+    # artifact actually published.
+    - name: Resolve and verify release version
+      run: |
+        VERSION=$(mvn --batch-mode -q help:evaluate \
+          -Dexpression=project.version -DforceStdout)
+        echo "pom version: ${VERSION}"
+        echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+        if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "tag version: ${TAG_VERSION}"
+          if [ "${TAG_VERSION}" != "${VERSION}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pom version ${VERSION}"
+            exit 1
+          fi
+        fi
+
     - name: Build, sign and stage (skip publishing)
       run: |
         mvn --batch-mode clean deploy \
@@ -64,7 +84,7 @@ jobs:
           --request POST \
           --header "Authorization: Bearer ${BEARER_TOKEN}" \
           --form bundle=@target/central-publishing/central-bundle.zip \
-          "https://central.sonatype.com/api/v1/publisher/upload?name=tencentcloud-agentobs-sdk-agentscope-java-0.0.2&publishingType=AUTOMATIC")
+          "https://central.sonatype.com/api/v1/publisher/upload?name=tencentcloud-agentobs-sdk-agentscope-java-${VERSION}&publishingType=AUTOMATIC")
         echo "HTTP response code: ${HTTP_CODE}"
         echo "Response body:"
         cat /tmp/upload_response.txt
